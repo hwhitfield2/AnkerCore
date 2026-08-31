@@ -53,6 +53,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var lastRecordingDuration: UInt32?
     @Published private(set) var recordings: [RecordingMetadata] = []
     @Published private(set) var recordingListState = "Connect to load recordings"
+    @Published private(set) var recordingsLoading = false
     @Published private(set) var transferState = "No audio transfer active"
     @Published private(set) var transferProgress = 0.0
     @Published private(set) var downloadedRecordings: [UInt32: URL] = [:]
@@ -71,13 +72,21 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var processingRecordingIDs: Set<UInt32> = []
 
     var canScan: Bool { central?.state == .poweredOn }
-    var canLoadRecordings: Bool { recorderCommandChannelReady }
+    var canLoadRecordings: Bool {
+        recorderCommandChannelReady
+            && transferHandle == nil
+            && pendingTransfer == nil
+            && !recordingsLoading
+    }
     var canFetchRecording: Bool { recorderCommandChannelReady && transferHandle == nil && pendingTransfer == nil }
 
     private var central: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
     private var writeCharacteristic: CBCharacteristic?
     private var metadataFallbackRequested = false
+    private var recordingListRequestID: UUID?
+    private var recordingListTimeoutWorkItem: DispatchWorkItem?
+    private var recordingListRefreshWorkItem: DispatchWorkItem?
     private let secureSession = D3200SecureSession()
     private var pendingTransfer: RecordingMetadata?
     private var transferHandle: FileHandle?
@@ -165,6 +174,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     }
 
     func loadRecordings() {
+        guard !recordingsLoading else { return }
         guard let peripheral = connectedPeripheral,
               let characteristic = writeCharacteristic,
               characteristic.service?.uuid.uuidString.uppercased()
@@ -177,6 +187,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
 
         metadataFallbackRequested = false
+        recordingsLoading = true
+        let requestID = UUID()
+        recordingListRequestID = requestID
         // Whitelisted, non-destructive command: list recording metadata, page zero.
         let command = Self.d3200Command(type: 0x1B, id: 0x0E, payload: Data([0x00, 0x00]))
         let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.write)
@@ -184,6 +197,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
             : .withoutResponse
         peripheral.writeValue(command, for: characteristic, type: writeType)
         recordingListState = "Loading recording list…"
+        scheduleRecordingListTimeout(for: requestID)
         record(
             kind: "command",
             summary: "Requested recording metadata (page 1)",
@@ -191,6 +205,39 @@ final class BluetoothProbe: NSObject, ObservableObject {
             service: characteristic.service?.uuid,
             characteristic: characteristic.uuid
         )
+    }
+
+    private func scheduleRecordingListTimeout(for requestID: UUID) {
+        recordingListTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.recordingListRequestID == requestID else { return }
+            self.recordingListRequestID = nil
+            self.recordingsLoading = false
+            self.recordingListState = "Recorder did not return its list — tap Refresh to retry"
+        }
+        recordingListTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
+    }
+
+    private func finishRecordingListRequest() {
+        recordingListTimeoutWorkItem?.cancel()
+        recordingListTimeoutWorkItem = nil
+        recordingListRequestID = nil
+        recordingsLoading = false
+    }
+
+    private func scheduleRecordingListRefresh(after delay: TimeInterval = 0.4) {
+        recordingListRefreshWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.transferHandle == nil, self.pendingTransfer == nil else {
+                self.scheduleRecordingListRefresh(after: 1)
+                return
+            }
+            self.loadRecordings()
+        }
+        recordingListRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func fetchRecording(_ recording: RecordingMetadata) {
@@ -857,6 +904,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferNonce = nil
         DispatchQueue.main.async { [weak self] in
             self?.resumeReconnectFetchesIfReady()
+            self?.scheduleRecordingListRefresh(after: 1)
         }
     }
 
@@ -1081,6 +1129,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
         if !recordings.contains(where: { $0.id == fileID }) {
             recordings.insert(metadata, at: 0)
         }
+        recordings.sort { $0.id > $1.id }
+        recordingListState = "New recording detected"
+        syncWidgetSnapshot()
         appendProcessingEvent(
             recording: metadata,
             stage: .capture,
@@ -1513,6 +1564,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
             : .withoutResponse
         peripheral.writeValue(fallback, for: characteristic, type: writeType)
         recordingListState = "Trying compatibility inventory request…"
+        if let requestID = recordingListRequestID {
+            scheduleRecordingListTimeout(for: requestID)
+        }
         record(
             kind: "command",
             summary: "New inventory request returned no entries; requested compatibility inventory",
@@ -1640,6 +1694,9 @@ extension BluetoothProbe: CBCentralManagerDelegate {
         connectedPeripheral = nil
         connectedPeripheralID = nil
         writeCharacteristic = nil
+        recordingListRefreshWorkItem?.cancel()
+        recordingListRefreshWorkItem = nil
+        finishRecordingListRequest()
         recordingListState = "Connect to load recordings"
         connectionState = shouldReconnect ? "Reconnecting to Soundcore Work…" : "Disconnected"
         record(
@@ -1731,10 +1788,11 @@ extension BluetoothProbe: CBPeripheralDelegate {
                characteristic.properties.contains(.write)
                 || characteristic.properties.contains(.writeWithoutResponse) {
                 writeCharacteristic = characteristic
-                recordingListState = "Ready to load recordings"
+                recordingListState = "Refreshing recordings…"
                 connectionState = "Connected to \(peripheral.name ?? "Soundcore Work")"
                 DispatchQueue.main.async { [weak self] in
                     self?.resumeReconnectFetchesIfReady()
+                    self?.scheduleRecordingListRefresh()
                 }
             }
             if characteristic.properties.contains(.read) {
@@ -1767,6 +1825,7 @@ extension BluetoothProbe: CBPeripheralDelegate {
         let decoded = Self.decodedD3200Event(data)
         let requestedFallback = requestLegacyRecordingListIfNeeded(for: data)
         if !requestedFallback, let loadedRecordings = Self.recordingList(from: data) {
+            finishRecordingListRequest()
             recordings = loadedRecordings
             recordingListState = loadedRecordings.isEmpty
                 ? "No recordings found"

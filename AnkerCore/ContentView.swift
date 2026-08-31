@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var probe = BluetoothProbe()
     @State private var showingSettings = false
 
@@ -35,6 +36,11 @@ struct ContentView: View {
         .tint(RelayPalette.coral)
         .preferredColorScheme(.dark)
         .task { probe.refreshTasks() }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            probe.refreshTasks()
+            if probe.canLoadRecordings { probe.loadRecordings() }
+        }
     }
 
     private var brandHeader: some View {
@@ -234,8 +240,17 @@ struct ContentView: View {
                         .foregroundStyle(RelayPalette.secondaryText)
                     Spacer()
                     Button { probe.loadRecordings() } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
+                        if probe.recordingsLoading {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Refreshing")
+                            }
                             .font(.caption.weight(.semibold))
+                        } else {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                                .font(.caption.weight(.semibold))
+                        }
                     }
                     .disabled(!probe.canLoadRecordings)
                 }
