@@ -126,7 +126,7 @@ curl https://YOUR-WORKER.workers.dev/health
 1. Open `AnkerCore.xcodeproj` in Xcode.
 2. Select the **AnkerCore** target, then **Signing & Capabilities**.
 3. Choose your development team.
-4. Change `com.example.AnkerCore` to a bundle identifier you control.
+4. The public target uses `com.ankercore.app`. Change it to a bundle identifier your team owns if you are creating a separate App Store record.
 5. Connect your iPhone, select it as the run destination, and press **Run**.
 6. Approve Bluetooth and Speech Recognition access when prompted.
 
@@ -137,6 +137,30 @@ In AnkerCore, open **Settings** and enter:
 - **Optional webhook:** a public HTTPS endpoint, or leave blank
 
 The private token and optional webhook URL are stored using `AfterFirstUnlockThisDeviceOnly` Keychain protection.
+
+## TestFlight releases
+
+AnkerCore includes a shared Release scheme, an App Store Connect export configuration, and a script that archives, signs, and uploads a unique build. Sign in to your Apple Account in **Xcode → Settings → Accounts** first, and make sure the app record's bundle ID matches the target.
+
+```bash
+export ANKERCORE_TEAM_ID=YOUR_10_CHARACTER_TEAM_ID
+./scripts/upload-testflight.sh
+```
+
+The default bundle ID is `com.ankercore.app` and the default version is `1.0`. Override either when operating your own fork:
+
+```bash
+ANKERCORE_TEAM_ID=YOUR_TEAM_ID \
+ANKERCORE_BUNDLE_ID=com.example.yourapp \
+ANKERCORE_VERSION=1.1 \
+./scripts/upload-testflight.sh
+```
+
+The script derives a unique numeric build string from the current UTC time. You can provide an explicit App Store build number with `ANKERCORE_BUILD_NUMBER=2`. Archive output stays under the ignored `build/TestFlight` directory. No App Store Connect passwords, API keys, private keys, or provisioning profiles belong in the repository.
+
+After Apple finishes processing the upload, open the app's **TestFlight** tab in App Store Connect, create an internal testing group, add your App Store Connect user, and enable automatic distribution if desired. The TestFlight build has a different app sandbox from earlier development bundle IDs, so enter the Worker `/audio` URL and private upload token once after installing it.
+
+Before external testing or App Store release, complete the App Privacy, privacy-policy URL, age-rating, export-compliance, and test-information sections in App Store Connect. AnkerCore's privacy manifest declares its app-scoped preferences access; the App Store privacy answers must also accurately describe the particular Worker, Notion workspace, AI providers, and optional webhook used by each deployment.
 
 ## 5. Connect and test
 

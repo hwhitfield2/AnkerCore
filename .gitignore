@@ -9,6 +9,8 @@ worker/.wrangler/
 # Xcode and Swift
 DerivedData/
 build/
+*.ipa
+*.xcarchive
 *.xcuserstate
 xcuserdata/
 *.moved-aside

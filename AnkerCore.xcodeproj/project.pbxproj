@@ -16,6 +16,7 @@
 		A10000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* Assets.xcassets */; };
 		A10000000000000000000008 /* OnDeviceProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* OnDeviceProcessor.swift */; };
 		A10000000000000000000009 /* VoiceIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* VoiceIdentity.swift */; };
+		A1000000000000000000000A /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B10000000000000000000001 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = B30000000000000000000001 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
@@ -32,6 +33,7 @@
 		A20000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A20000000000000000000011 /* OnDeviceProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnDeviceProcessor.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* VoiceIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceIdentity.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -67,6 +69,7 @@
 				A20000000000000000000011 /* OnDeviceProcessor.swift */,
 				A20000000000000000000012 /* VoiceIdentity.swift */,
 				A20000000000000000000010 /* Assets.xcassets */,
+				A20000000000000000000013 /* PrivacyInfo.xcprivacy */,
 				A20000000000000000000004 /* Info.plist */,
 			);
 			path = AnkerCore;
@@ -146,6 +149,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000007 /* Assets.xcassets in Resources */,
+				A1000000000000000000000A /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -216,7 +220,7 @@
 				INFOPLIST_FILE = AnkerCore/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.AnkerCore;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ankercore.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -239,7 +243,7 @@
 				INFOPLIST_FILE = AnkerCore/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.AnkerCore;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ankercore.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
