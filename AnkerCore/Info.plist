@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>AnkerCore uses Bluetooth to discover the services and notifications exposed by your Soundcore Work recorder.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

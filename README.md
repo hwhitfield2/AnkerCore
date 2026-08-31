@@ -160,6 +160,8 @@ The script derives a unique numeric build string from the current UTC time. You 
 
 After Apple finishes processing the upload, open the app's **TestFlight** tab in App Store Connect, create an internal testing group, add your App Store Connect user, and enable automatic distribution if desired. The TestFlight build has a different app sandbox from earlier development bundle IDs, so enter the Worker `/audio` URL and private upload token once after installing it.
 
+The app declares `ITSAppUsesNonExemptEncryption` as `false` because its cryptography is limited to exempt encryption supplied by Apple platform frameworks (including URLSession, CryptoKit, and CommonCrypto). The upload script verifies that declaration inside the signed archive and stops before upload if it is missing, preventing future TestFlight builds from landing in **Missing Compliance**. Revisit this classification before adding any bundled or proprietary cryptographic implementation; export classification remains the distributor's responsibility.
+
 Before external testing or App Store release, complete the App Privacy, privacy-policy URL, age-rating, export-compliance, and test-information sections in App Store Connect. AnkerCore's privacy manifest declares its app-scoped preferences access; the App Store privacy answers must also accurately describe the particular Worker, Notion workspace, AI providers, and optional webhook used by each deployment.
 
 ## 5. Connect and test

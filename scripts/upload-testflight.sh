@@ -61,6 +61,19 @@ xcodebuild \
   CURRENT_PROJECT_VERSION="$build_number" \
   clean archive
 
+archived_info="$archive_path/Products/Applications/AnkerCore.app/Info.plist"
+if [[ ! -f "$archived_info" ]]; then
+  echo "The archive is missing AnkerCore.app/Info.plist; refusing to upload." >&2
+  exit 65
+fi
+
+compliance_value="$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$archived_info" 2>/dev/null || true)"
+if [[ "$compliance_value" != "false" ]]; then
+  echo "ITSAppUsesNonExemptEncryption must be false for AnkerCore's exempt Apple-platform encryption; refusing to upload." >&2
+  exit 65
+fi
+echo "Export compliance: exempt encryption declaration verified."
+
 echo "Uploading AnkerCore $version ($build_number) to App Store Connect..."
 xcodebuild \
   -exportArchive \
