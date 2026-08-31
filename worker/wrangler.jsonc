@@ -5,6 +5,9 @@
   "compatibility_date": "2026-08-28",
   "workers_dev": true,
   "preview_urls": false,
+  "triggers": {
+    "crons": ["0 14 * * *"]
+  },
   "ai": {
     "binding": "AI"
   },
@@ -30,6 +33,12 @@
     "TASKS_DATABASE_ID": "REPLACE_AFTER_SETUP",
     "IDEAS_DATABASE_ID": "REPLACE_AFTER_SETUP",
     "RECENT_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "PEOPLE_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "PROJECTS_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "CLIENTS_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "PROCESSING_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "DIGESTS_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "FEEDBACK_DATABASE_ID": "REPLACE_AFTER_SETUP",
     "TIMEZONE_OFFSET": "-07:00",
     "CLASSIFIER_MODEL": "@cf/meta/llama-3.2-1b-instruct",
     "AI_CONFIDENCE_THRESHOLD": "0.68",

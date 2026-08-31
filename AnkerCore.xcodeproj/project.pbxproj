@@ -15,6 +15,8 @@
 		A10000000000000000000006 /* UploadClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* UploadClient.swift */; };
 		A10000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* Assets.xcassets */; };
 		A10000000000000000000008 /* OnDeviceProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* OnDeviceProcessor.swift */; };
+		A10000000000000000000009 /* VoiceIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* VoiceIdentity.swift */; };
+		B10000000000000000000001 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = B30000000000000000000001 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -29,6 +31,7 @@
 		A20000000000000000000009 /* UploadClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UploadClient.swift; sourceTree = "<group>"; };
 		A20000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A20000000000000000000011 /* OnDeviceProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnDeviceProcessor.swift; sourceTree = "<group>"; };
+		A20000000000000000000012 /* VoiceIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceIdentity.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -36,6 +39,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B10000000000000000000001 /* FluidAudio in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -61,6 +65,7 @@
 				A20000000000000000000008 /* OggOpusMuxer.swift */,
 				A20000000000000000000009 /* UploadClient.swift */,
 				A20000000000000000000011 /* OnDeviceProcessor.swift */,
+				A20000000000000000000012 /* VoiceIdentity.swift */,
 				A20000000000000000000010 /* Assets.xcassets */,
 				A20000000000000000000004 /* Info.plist */,
 			);
@@ -92,6 +97,7 @@
 			);
 			name = AnkerCore;
 			packageProductDependencies = (
+				B30000000000000000000001 /* FluidAudio */,
 			);
 			productName = AnkerCore;
 			productReference = A20000000000000000000005 /* AnkerCore.app */;
@@ -123,6 +129,9 @@
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A40000000000000000000003 /* Products */;
+			packageReferences = (
+				B20000000000000000000001 /* XCRemoteSwiftPackageReference "FluidAudio" */,
+			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -154,6 +163,7 @@
 				A10000000000000000000005 /* OggOpusMuxer.swift in Sources */,
 				A10000000000000000000006 /* UploadClient.swift in Sources */,
 				A10000000000000000000008 /* OnDeviceProcessor.swift in Sources */,
+				A10000000000000000000009 /* VoiceIdentity.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -262,6 +272,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B20000000000000000000001 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio.git";
+			requirement = {
+				kind = revision;
+				revision = 5c19d5e12320e22bbfb7a1877b089d2665a69add;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B30000000000000000000001 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B20000000000000000000001 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A80000000000000000000001 /* Project object */;
 }

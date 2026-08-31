@@ -1,10 +1,11 @@
 {
   "name": "ankercore",
   "version": "1.0.0",
+  "type": "module",
   "private": true,
   "description": "Privacy-first iPhone and Cloudflare companion for the Anker Soundcore Work recorder",
   "scripts": {
-    "check": "node --check worker/index.js",
+    "check": "node --check worker/index.js && node --test worker/index.test.js",
     "deploy": "wrangler deploy --config worker/wrangler.jsonc"
   },
   "devDependencies": {

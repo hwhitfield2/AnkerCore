@@ -1,6 +1,6 @@
 # AnkerCore
 
-AnkerCore is an unofficial iPhone companion for the Anker Soundcore Work recorder. Press the recorder button to start, press it again to stop, and AnkerCore securely fetches the completed recording, transcribes it, classifies it as a meeting, task, or idea, and routes it into Notion.
+AnkerCore is an unofficial iPhone companion for the Anker Soundcore Work recorder. Press the recorder button to start, press it again to stop, and AnkerCore securely fetches the completed recording, transcribes it, extracts every meeting, task, and idea, and routes linked records into Notion. The app also shows your live open-task list and can mark tasks complete.
 
 The processing path is privacy-first and cost-aware:
 
@@ -8,6 +8,7 @@ The processing path is privacy-first and cost-aware:
 2. Apple Intelligence classifies and summarizes on the iPhone when available.
 3. If local classification is unavailable, only transcript text is sent to Cloudflare's inexpensive classifier.
 4. Raw audio is sent to Cloudflare Whisper only when local transcription cannot run.
+5. Optional speaker diarization and enrolled voice identification run on the iPhone.
 
 An optional HTTPS webhook can receive the transcript and final Notion routing metadata. Raw audio and credentials are never included in webhook events.
 
@@ -24,6 +25,7 @@ An optional HTTPS webhook can receive the transcript and final Notion routing me
 - A Notion account with permission to create an internal integration
 - A Cloudflare account with Workers AI access
 - Node.js 20 or newer
+- Internet access on first voice enrollment so the open-source diarization models can download
 
 Cloudflare includes a daily Workers AI allocation. Review [current Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) before production use.
 
@@ -91,7 +93,7 @@ npx wrangler secret put SETUP_KEY --config worker/wrangler.jsonc
 
 Generate strong values with `openssl rand -hex 32`, but keep each result in a password manager and never paste it into source files, issues, or chat logs.
 
-Visit `https://YOUR-WORKER.workers.dev/setup`, enter the temporary setup key, and choose **Create Notion databases**. The setup page creates:
+Visit `https://YOUR-WORKER.workers.dev/setup`, enter the temporary setup key, and choose **Create a new Notion workspace**. The setup page creates:
 
 - AnkerCore Inbox
 - AnkerCore Hub
@@ -99,8 +101,14 @@ Visit `https://YOUR-WORKER.workers.dev/setup`, enter the temporary setup key, an
 - Tasks
 - Ideas
 - Recent Items
+- People
+- Projects
+- Clients
+- Processing Log
+- Daily Digests
+- Routing Feedback
 
-Copy the returned IDs into the matching `INBOX_PAGE_ID`, `MEETINGS_DATABASE_ID`, `TASKS_DATABASE_ID`, `IDEAS_DATABASE_ID`, and `RECENT_DATABASE_ID` fields in `worker/wrangler.jsonc`. Redeploy:
+Copy every returned ID into its matching field in `worker/wrangler.jsonc`. Existing installations can deploy the new Worker temporarily with `SETUP_KEY`, visit `/setup`, and choose **Upgrade existing AnkerCore databases**; rows are retained while the new databases, properties, and relations are added.
 
 ```bash
 npm run deploy
@@ -139,12 +147,13 @@ The private token and optional webhook URL are stored using `AfterFirstUnlockThi
 5. Make a short, non-sensitive test recording with the physical button.
 6. Press the button again to stop.
 7. Watch **Automatic flow**: AnkerCore fetches the file, transcribes it, routes it, and shows a link to the resulting Notion item.
+8. Use **My tasks** to open or complete extracted actions without opening Notion.
 
 The first on-device transcription may download an Apple speech asset. If local speech or Apple Intelligence is unavailable, the status card clearly identifies the cloud fallback used.
 
 ## Routing behavior
 
-AnkerCore creates one routed item in Meetings, Tasks, or Ideas and labels it as:
+One recording can create a meeting, multiple tasks, and multiple ideas. AnkerCore links these to the source transcript, project, client, people, and origin meeting when those facts are present. It labels each recording as:
 
 - **Work** — employer, client, team, or primary-job duties
 - **Personal Life** — home, family, health, errands, or leisure
@@ -152,6 +161,27 @@ AnkerCore creates one routed item in Meetings, Tasks, or Ideas and labels it as:
 - **Needs Review** — confidence is below the configured threshold
 
 You can force a route by beginning a note with an explicit cue such as `Task:`, `Meeting:`, `Idea:`, `Work:`, `Personal Life:`, or `Personal Work:`.
+
+Tasks include status, priority, owner, due date, source quote, and context. Meetings include participants, decisions, open questions, follow-up, and linked actions. Ideas include topic, why it matters, and a next experiment. Uncertain records remain visible with **Needs Review** instead of silently guessing.
+
+## Voice identity
+
+AnkerCore can turn a diarized transcript into lines such as `Hayden: …`, `Carter: …`, and `Peter: …`:
+
+1. Fetch a clean recording containing at least five seconds of only one person.
+2. Tap the people-and-wave icon beside that recording.
+3. Enter the person's name and confirm their explicit consent.
+4. Repeat with a separate solo sample for each consenting person.
+
+The first enrollment downloads FluidAudio's diarization models. Mathematical voice embeddings are stored with complete file protection, only on that iPhone, and excluded from backup. Embeddings are never uploaded to Cloudflare, Notion, webhooks, or diagnostics. A successfully recognized name becomes part of the transcript label and therefore follows the configured transcript route to Notion/cloud/webhooks. Delete a profile from **Settings → Voice identities**. Unknown or low-confidence voices keep neutral labels such as `Speaker 1`; AnkerCore does not guess a person's identity.
+
+## Task list, processing log, and daily focus
+
+The authenticated `GET /tasks` endpoint powers the app's running open-task list. `POST /tasks/{page-id}/complete` verifies that the page belongs to the configured Tasks database before marking it done. The Processing Log records stages, mode, item count, destinations, and sanitized errors without copying transcript or audio content.
+
+The Worker cron in `wrangler.jsonc` creates an idempotent Daily Digest at 14:00 UTC (07:00 in Arizona) with open, due, overdue, and needs-review actions. Change the cron for another local time. An authenticated `POST /digest` can generate today's digest on demand.
+
+When a user corrects the Area on a routed Notion page, the signed Notion `page.properties_updated` webhook records the correction in Routing Feedback. Learned corrections are supplied as untrusted examples to later cloud classifications, creating an auditable feedback loop without modifying or uploading voice profiles.
 
 ## Optional webhook
 
@@ -169,7 +199,12 @@ After Notion routing, AnkerCore sends a `POST` request with `Content-Type: appli
     "area": "Work",
     "confidence": 0.91,
     "destination": "https://www.notion.so/...",
-    "database": "https://app.notion.com/p/..."
+    "database": "https://app.notion.com/p/...",
+    "item_count": 3,
+    "destinations": [
+      {"kind": "meeting", "destination": "https://www.notion.so/...", "database": "https://app.notion.com/p/..."},
+      {"kind": "task", "destination": "https://www.notion.so/...", "database": "https://app.notion.com/p/..."}
+    ]
   }
 }
 ```
@@ -188,6 +223,8 @@ The app declares Bluetooth central background mode and uses state restoration. i
 - The Worker requires a constant-time-compared bearer token before reading uploads.
 - Audio uploads are type, size, length, file-ID, and Ogg-signature validated.
 - Transcript uploads and on-device model output are size- and schema-validated.
+- Task mutations authenticate, validate page IDs, and verify database ownership before updating Notion.
+- Voice enrollment requires explicit consent; embeddings are device-only, protected, excluded from backup, and user-deletable.
 - Prompt instructions treat transcripts as untrusted data and do not follow instructions inside them.
 - Outbound webhooks are HTTPS-only, reject local/literal-IP targets, do not follow redirects, and time out.
 - Worker responses use generic errors and do not log transcript, audio, tokens, or keys.

@@ -61,6 +61,11 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var uploadConfigured = AnkerCoreUploadClient.hasToken
     @Published private(set) var lastDestinationURL: URL?
     @Published private(set) var processingMode = "On-device preferred"
+    @Published private(set) var openTasks: [AnkerCoreTask] = []
+    @Published private(set) var tasksState = "Connect your private route to load tasks"
+    @Published private(set) var tasksLoading = false
+    @Published private(set) var voiceProfiles: [VoiceProfile] = []
+    @Published private(set) var voiceIdentityState = "No voice profiles enrolled"
 
     var canScan: Bool { central?.state == .poweredOn }
     var canLoadRecordings: Bool { writeCharacteristic != nil }
@@ -100,6 +105,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
             options: [CBCentralManagerOptionRestoreIdentifierKey: "AnkerCore.central"]
         )
         record(kind: "capture", summary: "Started a new local diagnostic capture")
+        reloadVoiceProfiles()
     }
 
     deinit {
@@ -204,6 +210,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
             uploadState = AnkerCoreUploadClient.savedWebhookURL.isEmpty
                 ? "Automatic processing is ready"
                 : "Automatic processing and webhook delivery are ready"
+            refreshTasks()
             return nil
         } catch {
             return error.localizedDescription
@@ -215,8 +222,96 @@ final class BluetoothProbe: NSObject, ObservableObject {
             try AnkerCoreUploadClient.clearToken()
             uploadConfigured = false
             uploadState = "Automatic processing is off"
+            openTasks = []
+            tasksState = "Connect your private route to load tasks"
         } catch {
             uploadState = error.localizedDescription
+        }
+    }
+
+    func refreshTasks() {
+        guard uploadConfigured, !tasksLoading else { return }
+        tasksLoading = true
+        tasksState = "Refreshing…"
+        Task {
+            do {
+                let tasks = try await uploadClient.fetchOpenTasks()
+                await MainActor.run {
+                    openTasks = tasks
+                    tasksState = tasks.isEmpty ? "You’re all caught up" : "\(tasks.count) open"
+                    tasksLoading = false
+                }
+            } catch {
+                await MainActor.run {
+                    tasksState = error.localizedDescription
+                    tasksLoading = false
+                }
+            }
+        }
+    }
+
+    func completeTask(_ task: AnkerCoreTask) {
+        guard !tasksLoading else { return }
+        tasksLoading = true
+        tasksState = "Completing task…"
+        Task {
+            do {
+                _ = try await uploadClient.completeTask(id: task.id)
+                await MainActor.run {
+                    openTasks.removeAll { $0.id == task.id }
+                    tasksState = openTasks.isEmpty ? "You’re all caught up" : "\(openTasks.count) open"
+                    tasksLoading = false
+                }
+            } catch {
+                await MainActor.run {
+                    tasksState = error.localizedDescription
+                    tasksLoading = false
+                }
+            }
+        }
+    }
+
+    func reloadVoiceProfiles() {
+        Task {
+            do {
+                let profiles = try await VoiceIdentityEngine.shared.profiles()
+                await MainActor.run {
+                    voiceProfiles = profiles.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                    voiceIdentityState = profiles.isEmpty ? "No voice profiles enrolled" : "\(profiles.count) enrolled on this iPhone"
+                }
+            } catch {
+                await MainActor.run { voiceIdentityState = error.localizedDescription }
+            }
+        }
+    }
+
+    func enrollVoice(name: String, recording: RecordingMetadata, consentConfirmed: Bool) async -> String? {
+        guard let url = downloadedRecordings[recording.id], url.pathExtension == "ogg" else {
+            return "Fetch the playable recording before enrolling this voice."
+        }
+        await MainActor.run { voiceIdentityState = "Building a private voice signature…" }
+        do {
+            _ = try await VoiceIdentityEngine.shared.enroll(
+                name: name,
+                from: url,
+                consentConfirmed: consentConfirmed
+            )
+            reloadVoiceProfiles()
+            return nil
+        } catch {
+            await MainActor.run { voiceIdentityState = error.localizedDescription }
+            return error.localizedDescription
+        }
+    }
+
+    func deleteVoiceProfile(_ profile: VoiceProfile) {
+        Task {
+            do {
+                try await VoiceIdentityEngine.shared.delete(id: profile.id)
+                reloadVoiceProfiles()
+            } catch {
+                await MainActor.run { voiceIdentityState = error.localizedDescription }
+            }
         }
     }
 
@@ -664,7 +759,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
         if let destination = result.routed?.destination {
             lastDestinationURL = destination
-            uploadState = "Processed as \(result.routed?.kind ?? "item") · \(result.routed?.area ?? "Needs Review")\(webhookSuffix)"
+            let count = result.routed?.itemCount ?? result.routed?.destinations?.count ?? 1
+            uploadState = "Processed \(count) \(count == 1 ? "item" : "items") · \(result.routed?.area ?? "Needs Review")\(webhookSuffix)"
+            refreshTasks()
         } else if result.routed?.reason == "already_routed" {
             lastDestinationURL = result.source
             uploadState = "This recording was already processed\(webhookSuffix)"

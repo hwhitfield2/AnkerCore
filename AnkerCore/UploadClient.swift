@@ -3,12 +3,25 @@ import Security
 
 struct AnkerCoreUploadResult: Decodable {
     struct Routed: Decodable {
+        struct Destination: Decodable {
+            let kind: String
+            let destination: URL
+            let database: URL
+        }
+
         let kind: String?
         let area: String?
         let destination: URL?
         let database: URL?
         let ignored: Bool?
         let reason: String?
+        let destinations: [Destination]?
+        let itemCount: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case kind, area, destination, database, ignored, reason, destinations
+            case itemCount = "item_count"
+        }
     }
 
     struct Webhook: Decodable {
@@ -30,6 +43,33 @@ struct AnkerCoreUploadResult: Decodable {
         case routed
         case webhook
     }
+}
+
+struct AnkerCoreTask: Identifiable, Decodable, Sendable {
+    let id: String
+    let title: String
+    let status: String
+    let due: String?
+    let priority: String
+    let area: String
+    let owner: String
+    let url: URL
+
+    var dueDate: Date? {
+        guard let due else { return nil }
+        return ISO8601DateFormatter().date(from: due)
+            ?? DateFormatter.ankercoreDay.date(from: String(due.prefix(10)))
+    }
+}
+
+private struct AnkerCoreTaskList: Decodable {
+    let ok: Bool
+    let tasks: [AnkerCoreTask]
+}
+
+private struct AnkerCoreTaskMutation: Decodable {
+    let ok: Bool
+    let task: AnkerCoreTask
 }
 
 enum AnkerCoreUploadError: LocalizedError {
@@ -137,6 +177,28 @@ struct AnkerCoreUploadClient {
         throw AnkerCoreUploadError.rejected(reason ?? "HTTP \(http.statusCode)")
     }
 
+    func fetchOpenTasks() async throws -> [AnkerCoreTask] {
+        let request = try authorizedRequest(path: "/tasks", method: "GET")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw AnkerCoreUploadError.invalidResponse }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            let reason = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            throw AnkerCoreUploadError.rejected(reason ?? "HTTP \(http.statusCode)")
+        }
+        return try JSONDecoder().decode(AnkerCoreTaskList.self, from: data).tasks
+    }
+
+    func completeTask(id: String) async throws -> AnkerCoreTask {
+        let safeID = id.filter { $0.isHexDigit || $0 == "-" }
+        guard safeID.count == id.count, (32 ... 36).contains(safeID.count) else { throw AnkerCoreUploadError.invalidResponse }
+        let request = try authorizedRequest(path: "/tasks/\(safeID)/complete", method: "POST")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
+            throw AnkerCoreUploadError.rejected("task_update_failed")
+        }
+        return try JSONDecoder().decode(AnkerCoreTaskMutation.self, from: data).task
+    }
+
     @available(iOS 26.0, *)
     func routeTranscript(
         _ transcript: String,
@@ -162,16 +224,34 @@ struct AnkerCoreUploadClient {
         if !webhookURL.isEmpty { payload["webhook_url"] = webhookURL }
         if let analysis {
             payload["analysis"] = [
-                "type": analysis.type,
                 "area": analysis.area,
-                "type_confidence": analysis.typeConfidence,
                 "area_confidence": analysis.areaConfidence,
-                "title": analysis.title,
                 "summary": analysis.summary,
-                "person": analysis.person,
-                "due_date": analysis.dueDate,
-                "participants": analysis.participants,
-                "topic": analysis.topic,
+                "project": analysis.project,
+                "client": analysis.client,
+                "people": analysis.people,
+                "meeting": analysis.hasMeeting ? [
+                    "title": analysis.meetingTitle,
+                    "participants": analysis.participants,
+                    "decisions": analysis.decisions,
+                    "open_questions": analysis.openQuestions,
+                    "follow_up": analysis.followUp,
+                ] : NSNull(),
+                "tasks": analysis.tasks.map { [
+                    "title": $0.title,
+                    "owner": $0.owner,
+                    "due_date": $0.dueDate,
+                    "priority": $0.priority,
+                    "summary": $0.summary,
+                    "source_quote": $0.sourceQuote,
+                ] },
+                "ideas": analysis.ideas.map { [
+                    "title": $0.title,
+                    "topic": $0.topic,
+                    "summary": $0.summary,
+                    "why_it_matters": $0.whyItMatters,
+                    "next_experiment": $0.nextExperiment,
+                ] },
             ]
         }
 
@@ -192,6 +272,22 @@ struct AnkerCoreUploadClient {
         }
         let reason = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
         throw AnkerCoreUploadError.rejected(reason ?? "HTTP \(http.statusCode)")
+    }
+
+    private func authorizedRequest(path: String, method: String) throws -> URLRequest {
+        guard let base = URL(string: Self.savedEndpoint), base.scheme == "https" else { throw AnkerCoreUploadError.invalidEndpoint }
+        guard let token = try Self.readToken() else { throw AnkerCoreUploadError.missingToken }
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        components?.path = path
+        components?.query = nil
+        components?.fragment = nil
+        guard let url = components?.url else { throw AnkerCoreUploadError.invalidEndpoint }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 45
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if method != "GET" { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        return request
     }
 
     private static func storeSecret(_ value: String, account: String) throws {
@@ -239,4 +335,14 @@ struct AnkerCoreUploadClient {
         }
         return !host.contains(":") && host.split(separator: ".").contains(where: { Int($0) == nil })
     }
+}
+
+private extension DateFormatter {
+    static let ankercoreDay: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 }

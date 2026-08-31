@@ -13,6 +13,7 @@ struct ContentView: View {
                     LazyVStack(spacing: 16) {
                         brandHeader
                         recorderHero
+                        tasksCard
                         connectionCard
                         pipelineCard
                         recordingsCard
@@ -32,6 +33,7 @@ struct ContentView: View {
         }
         .tint(RelayPalette.coral)
         .preferredColorScheme(.dark)
+        .task { probe.refreshTasks() }
     }
 
     private var brandHeader: some View {
@@ -142,6 +144,44 @@ struct ContentView: View {
                     }
                     .buttonStyle(RelayPrimaryButtonStyle())
                     .disabled(!probe.canScan)
+                }
+            }
+        }
+    }
+
+    private var tasksCard: some View {
+        RelayCard(title: "My tasks", icon: "checklist") {
+            VStack(spacing: 11) {
+                HStack {
+                    Text(probe.tasksState)
+                        .font(.caption)
+                        .foregroundStyle(RelayPalette.secondaryText)
+                        .lineLimit(2)
+                    Spacer()
+                    Button { probe.refreshTasks() } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption.weight(.bold))
+                            .rotationEffect(.degrees(probe.tasksLoading ? 180 : 0))
+                    }
+                    .disabled(!probe.uploadConfigured || probe.tasksLoading)
+                }
+
+                if probe.openTasks.isEmpty {
+                    HStack(spacing: 12) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.title2)
+                            .foregroundStyle(RelayPalette.mint)
+                        Text(probe.uploadConfigured ? "New action items will collect here." : "Connect the private route in Settings to see your running list.")
+                            .font(.subheadline)
+                            .foregroundStyle(RelayPalette.secondaryText)
+                        Spacer()
+                    }
+                    .padding(.vertical, 5)
+                } else {
+                    ForEach(Array(probe.openTasks.prefix(12).enumerated()), id: \.element.id) { index, task in
+                        if index > 0 { Divider().overlay(RelayPalette.stroke) }
+                        TaskRow(task: task, isBusy: probe.tasksLoading) { probe.completeTask(task) }
+                    }
                 }
             }
         }
@@ -343,6 +383,7 @@ private struct PipelineStep: View {
 private struct RecordingRow: View {
     @ObservedObject var probe: BluetoothProbe
     let recording: RecordingMetadata
+    @State private var showingEnrollment = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -358,10 +399,18 @@ private struct RecordingRow: View {
             }
             Spacer()
             if let url = probe.downloadedRecordings[recording.id] {
-                ShareLink(item: url) {
-                    Image(systemName: "square.and.arrow.up")
-                        .frame(width: 36, height: 36)
-                        .background(RelayPalette.surfaceRaised, in: Circle())
+                HStack(spacing: 5) {
+                    Button { showingEnrollment = true } label: {
+                        Image(systemName: "person.wave.2.fill")
+                            .frame(width: 36, height: 36)
+                            .background(RelayPalette.surfaceRaised, in: Circle())
+                    }
+                    .accessibilityLabel("Enroll a voice from this recording")
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
+                            .frame(width: 36, height: 36)
+                            .background(RelayPalette.surfaceRaised, in: Circle())
+                    }
                 }
             } else {
                 Button("Fetch") { probe.fetchRecording(recording) }
@@ -370,6 +419,117 @@ private struct RecordingRow: View {
             }
         }
         .padding(.vertical, 2)
+        .sheet(isPresented: $showingEnrollment) {
+            VoiceEnrollmentView(probe: probe, recording: recording)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(RelayPalette.background)
+        }
+    }
+}
+
+private struct VoiceEnrollmentView: View {
+    @ObservedObject var probe: BluetoothProbe
+    let recording: RecordingMetadata
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var consentConfirmed = false
+    @State private var isEnrolling = false
+    @State private var error: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Clean voice sample") {
+                    TextField("Speaker name", text: $name)
+                    Text("Use a recording containing at least five seconds of only this person. Background speech reduces accuracy.")
+                        .font(.caption)
+                        .foregroundStyle(RelayPalette.secondaryText)
+                }
+                Section("Consent") {
+                    Toggle("This person consented to voice identification", isOn: $consentConfirmed)
+                    Text("The mathematical voice signature stays on this iPhone and can be deleted. A recognized name becomes a transcript label and follows your configured Notion/cloud route.")
+                        .font(.caption)
+                        .foregroundStyle(RelayPalette.secondaryText)
+                }
+                if let error { Section { Text(error).foregroundStyle(RelayPalette.coral) } }
+                Section {
+                    Button {
+                        isEnrolling = true
+                        Task {
+                            error = await probe.enrollVoice(name: name, recording: recording, consentConfirmed: consentConfirmed)
+                            isEnrolling = false
+                            if error == nil { dismiss() }
+                        }
+                    } label: {
+                        HStack {
+                            if isEnrolling { ProgressView().padding(.trailing, 5) }
+                            Text(isEnrolling ? "Creating voice signature…" : "Enroll voice")
+                        }
+                    }
+                    .disabled(isEnrolling || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !consentConfirmed)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(RelayPalette.background)
+            .navigationTitle("Voice identity")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+        }
+        .preferredColorScheme(.dark)
+        .tint(RelayPalette.coral)
+    }
+}
+
+private struct TaskRow: View {
+    let task: AnkerCoreTask
+    let isBusy: Bool
+    let onComplete: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            Button(action: onComplete) {
+                Image(systemName: "circle")
+                    .font(.title3)
+                    .foregroundStyle(priorityColor)
+            }
+            .disabled(isBusy)
+            .accessibilityLabel("Complete \(task.title)")
+
+            Link(destination: task.url) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(task.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.leading)
+                    HStack(spacing: 7) {
+                        Text(task.priority)
+                            .foregroundStyle(priorityColor)
+                        if let date = task.dueDate {
+                            Text("·")
+                            Text(date, format: .dateTime.month(.abbreviated).day())
+                                .foregroundStyle(date < Calendar.current.startOfDay(for: Date()) ? RelayPalette.coral : RelayPalette.secondaryText)
+                        }
+                        if !task.owner.isEmpty {
+                            Text("· \(task.owner)")
+                                .lineLimit(1)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(RelayPalette.secondaryText)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var priorityColor: Color {
+        switch task.priority {
+        case "Urgent": RelayPalette.coral
+        case "High": RelayPalette.amber
+        case "Low": RelayPalette.secondaryText
+        default: RelayPalette.sky
+        }
     }
 }
 
@@ -457,12 +617,36 @@ private struct SettingsView: View {
                         .foregroundStyle(RelayPalette.secondaryText)
                 }
 
+                Section("Voice identities · on this iPhone") {
+                    if probe.voiceProfiles.isEmpty {
+                        Text("Fetch a clean solo recording, then tap the people-and-wave icon beside it to enroll a consenting speaker.")
+                            .font(.caption)
+                            .foregroundStyle(RelayPalette.secondaryText)
+                    } else {
+                        ForEach(probe.voiceProfiles) { profile in
+                            HStack {
+                                Label(profile.name, systemImage: "person.wave.2.fill")
+                                Spacer()
+                                Button(role: .destructive) { probe.deleteVoiceProfile(profile) } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .accessibilityLabel("Delete voice profile for \(profile.name)")
+                            }
+                        }
+                    }
+                    Text(probe.voiceIdentityState)
+                        .font(.caption)
+                        .foregroundStyle(RelayPalette.secondaryText)
+                }
+
                 Section("Privacy") {
                     Label("Token protected by iPhone Keychain", systemImage: "key.fill")
                     Label("Audio stays on iPhone when local speech succeeds", systemImage: "iphone.gen3.radiowaves.left.and.right")
                     Label("Cloud receives text only when local sorting needs help", systemImage: "text.badge.checkmark")
                     Label("Raw audio uses cloud only as a transcription fallback", systemImage: "icloud.and.arrow.up")
                     Label("No audio or keys in diagnostic logs", systemImage: "eye.slash.fill")
+                    Label("Voice signatures stay on this iPhone and are excluded from backup", systemImage: "person.badge.shield.checkmark.fill")
+                    Label("Unknown or uncertain voices keep generic Speaker labels", systemImage: "questionmark.circle.fill")
                 }
 
                 Section("Diagnostics") {
