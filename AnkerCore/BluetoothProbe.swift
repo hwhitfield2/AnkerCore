@@ -71,8 +71,8 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var processingRecordingIDs: Set<UInt32> = []
 
     var canScan: Bool { central?.state == .poweredOn }
-    var canLoadRecordings: Bool { writeCharacteristic != nil }
-    var canFetchRecording: Bool { writeCharacteristic != nil && transferHandle == nil }
+    var canLoadRecordings: Bool { recorderCommandChannelReady }
+    var canFetchRecording: Bool { recorderCommandChannelReady && transferHandle == nil && pendingTransfer == nil }
 
     private var central: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
@@ -91,6 +91,12 @@ final class BluetoothProbe: NSObject, ObservableObject {
     private let onDeviceProcessor = OnDeviceProcessor()
     private var lastAutoRequestedID: UInt32?
     private var pendingReprocessIDs: Set<UInt32> = []
+    private var reconnectPeripheral: CBPeripheral?
+    private var reconnectAttempt = 0
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var userRequestedDisconnect = false
+    private var reconnectFetches: [UInt32: RecordingMetadata] = [:]
+    private var reconnectWaitLoggedIDs: Set<UInt32> = []
     private var logHandle: FileHandle?
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -110,6 +116,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         )
         record(kind: "capture", summary: "Started a new local diagnostic capture")
         restoreDownloadedRecordings()
+        restoreReconnectFetches()
         reloadVoiceProfiles()
         syncWidgetSnapshot()
         if uploadConfigured { testUploadConnection() }
@@ -140,18 +147,19 @@ final class BluetoothProbe: NSObject, ObservableObject {
     func connect(to identifier: UUID) {
         guard let device = devices.first(where: { $0.id == identifier }) else { return }
         stopScanning()
-        connectionState = "Connecting to \(device.name)…"
-        device.peripheral.delegate = self
-        central.connect(device.peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
-        record(
-            kind: "connect",
-            summary: "Requested connection to \(device.name)",
-            peripheral: device.peripheral
-        )
+        userRequestedDisconnect = false
+        reconnectAttempt = 0
+        UserDefaults.standard.set(true, forKey: Self.autoReconnectKey)
+        rememberRecorder(device.peripheral)
+        requestConnection(to: device.peripheral, reason: "Connecting to \(device.name)…")
     }
 
     func disconnect() {
         guard let peripheral = connectedPeripheral else { return }
+        userRequestedDisconnect = true
+        UserDefaults.standard.set(false, forKey: Self.autoReconnectKey)
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
         central.cancelPeripheralConnection(peripheral)
         record(kind: "disconnect", summary: "Requested disconnect", peripheral: peripheral)
     }
@@ -186,17 +194,26 @@ final class BluetoothProbe: NSObject, ObservableObject {
     }
 
     func fetchRecording(_ recording: RecordingMetadata) {
-        guard transferHandle == nil else {
-            transferState = "Another transfer is already active"
-            appendProcessingEvent(
-                recording: recording,
-                stage: .fetch,
-                state: .attention,
-                title: "Fetch not started",
-                detail: "Another recording transfer is already active. Try again when it finishes."
-            )
+        guard transferHandle == nil, pendingTransfer == nil else {
+            reconnectFetches[recording.id] = recording
+            uploadState = "Recording queued behind the active audio transfer…"
+            if reconnectWaitLoggedIDs.insert(recording.id).inserted {
+                appendProcessingEvent(
+                    recording: recording,
+                    stage: .fetch,
+                    state: .waiting,
+                    title: "Fetch queued",
+                    detail: "Another audio transfer is active. AnkerCore will fetch this recording next."
+                )
+            }
             return
         }
+        guard recorderCommandChannelReady else {
+            queueFetchUntilReconnected(recording)
+            return
+        }
+        reconnectFetches.removeValue(forKey: recording.id)
+        reconnectWaitLoggedIDs.remove(recording.id)
         appendProcessingEvent(
             recording: recording,
             stage: .fetch,
@@ -216,7 +233,8 @@ final class BluetoothProbe: NSObject, ObservableObject {
         } else {
             let publicKey = secureSession.beginHandshake()
             guard sendKnownCommand(type: 0x2E, id: 0x01, payload: publicKey) else {
-                failTransfer("Recorder command channel is not ready")
+                suspendTransferForReconnect()
+                scheduleReconnect(to: connectedPeripheral ?? savedRecorder())
                 return
             }
             record(kind: "secure-transfer", summary: "Requested an ephemeral encrypted session")
@@ -372,7 +390,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
     }
 
     func isProcessing(_ recording: RecordingMetadata) -> Bool {
-        processingRecordingIDs.contains(recording.id) || pendingTransfer?.id == recording.id
+        processingRecordingIDs.contains(recording.id)
+            || pendingTransfer?.id == recording.id
+            || reconnectFetches[recording.id] != nil
     }
 
     func canReprocess(_ recording: RecordingMetadata) -> Bool {
@@ -612,6 +632,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @discardableResult
     private func sendKnownCommand(type: UInt8, id: UInt8, payload: Data) -> Bool {
         guard let peripheral = connectedPeripheral,
+              peripheral.state == .connected,
               let characteristic = writeCharacteristic
         else { return false }
         let command = Self.d3200Command(type: type, id: id, payload: payload)
@@ -628,7 +649,8 @@ final class BluetoothProbe: NSObject, ObservableObject {
         payload.append(Self.littleEndianData(recording.id))
         payload.append(0x00) // Offline transfer, never a live microphone stream.
         guard sendKnownCommand(type: 0x1A, id: 0x07, payload: payload) else {
-            failTransfer("Recorder command channel is not ready")
+            suspendTransferForReconnect()
+            scheduleReconnect(to: connectedPeripheral ?? savedRecorder())
             return
         }
         transferState = "Requesting encrypted recording…"
@@ -833,6 +855,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferURL = nil
         transferFileKey = nil
         transferNonce = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.resumeReconnectFetchesIfReady()
+        }
     }
 
     private func uploadRecording(_ fileURL: URL, recording: RecordingMetadata, reprocess: Bool = false) {
@@ -1065,18 +1090,151 @@ final class BluetoothProbe: NSObject, ObservableObject {
         )
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self else { return }
-            if self.canFetchRecording {
-                self.fetchRecording(metadata)
-            } else {
-                self.uploadState = "Could not fetch automatically; use Fetch Audio after reconnecting"
-                self.appendProcessingEvent(
-                    recording: metadata,
-                    stage: .fetch,
-                    state: .failed,
-                    title: "Automatic fetch unavailable",
-                    detail: "Reconnect Soundcore Work, then tap Fetch to retry this recording."
-                )
-            }
+            self.fetchRecording(metadata)
+        }
+    }
+
+    private var recorderCommandChannelReady: Bool {
+        connectedPeripheral?.state == .connected && writeCharacteristic != nil
+    }
+
+    private static let preferredRecorderKey = "AnkerCore.preferred-recorder-id"
+    private static let autoReconnectKey = "AnkerCore.auto-reconnect-enabled"
+
+    private var autoReconnectEnabled: Bool {
+        UserDefaults.standard.object(forKey: Self.autoReconnectKey) == nil
+            || UserDefaults.standard.bool(forKey: Self.autoReconnectKey)
+    }
+
+    private func rememberRecorder(_ peripheral: CBPeripheral) {
+        reconnectPeripheral = peripheral
+        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.preferredRecorderKey)
+    }
+
+    private func savedRecorder() -> CBPeripheral? {
+        if let reconnectPeripheral { return reconnectPeripheral }
+        guard let value = UserDefaults.standard.string(forKey: Self.preferredRecorderKey),
+              let identifier = UUID(uuidString: value)
+        else { return nil }
+        let peripheral = central.retrievePeripherals(withIdentifiers: [identifier]).first
+        if let peripheral { reconnectPeripheral = peripheral }
+        return peripheral
+    }
+
+    private func requestConnection(to peripheral: CBPeripheral, reason: String) {
+        guard central.state == .poweredOn else { return }
+        rememberRecorder(peripheral)
+        peripheral.delegate = self
+        switch peripheral.state {
+        case .connected:
+            connectedPeripheral = peripheral
+            connectedPeripheralID = peripheral.identifier
+            connectionState = "Restoring recorder controls…"
+            writeCharacteristic = nil
+            peripheral.discoverServices(nil)
+        case .connecting:
+            connectionState = reason
+        default:
+            connectionState = reason
+            central.connect(
+                peripheral,
+                options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true]
+            )
+            record(kind: "connect", summary: reason, peripheral: peripheral)
+        }
+    }
+
+    private func scheduleReconnect(to peripheral: CBPeripheral? = nil) {
+        guard autoReconnectEnabled, !userRequestedDisconnect, central.state == .poweredOn else { return }
+        if let peripheral { rememberRecorder(peripheral) }
+        guard let target = peripheral ?? savedRecorder() else { return }
+        guard target.state != .connected, target.state != .connecting else { return }
+
+        reconnectWorkItem?.cancel()
+        let attempt = reconnectAttempt
+        let delay = min(pow(2.0, Double(attempt)), 15.0)
+        reconnectAttempt += 1
+        connectionState = attempt == 0 ? "Reconnecting to Soundcore Work…" : "Recorder reconnect queued…"
+        let work = DispatchWorkItem { [weak self, weak target] in
+            guard let self, let target, !self.userRequestedDisconnect else { return }
+            self.requestConnection(to: target, reason: "Reconnecting to Soundcore Work…")
+        }
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func reconnectSavedRecorderIfNeeded() {
+        guard autoReconnectEnabled,
+              connectedPeripheral == nil,
+              let peripheral = savedRecorder()
+        else { return }
+        scheduleReconnect(to: peripheral)
+    }
+
+    private func restoreReconnectFetches() {
+        for log in processingLogs.values {
+            guard log.latestEvent?.stage == .fetch,
+                  log.latestEvent?.state == .waiting,
+                  downloadedRecordings[log.id] == nil
+            else { continue }
+            reconnectFetches[log.id] = RecordingMetadata(id: log.id, endTime: nil, sizeBytes: 0)
+            reconnectWaitLoggedIDs.insert(log.id)
+        }
+    }
+
+    private func queueFetchUntilReconnected(_ recording: RecordingMetadata) {
+        reconnectFetches[recording.id] = recording
+        uploadState = "Recording saved — reconnecting to fetch audio…"
+        transferState = "Waiting for recorder to reconnect"
+        if reconnectWaitLoggedIDs.insert(recording.id).inserted {
+            appendProcessingEvent(
+                recording: recording,
+                stage: .fetch,
+                state: .waiting,
+                title: "Waiting for recorder",
+                detail: "AnkerCore is reconnecting to Soundcore Work and will fetch this recording automatically."
+            )
+        }
+        if let peripheral = connectedPeripheral ?? savedRecorder(), peripheral.state == .connected {
+            writeCharacteristic = nil
+            peripheral.delegate = self
+            peripheral.discoverServices(nil)
+        } else {
+            scheduleReconnect(to: connectedPeripheral ?? savedRecorder())
+        }
+    }
+
+    private func resumeReconnectFetchesIfReady() {
+        guard recorderCommandChannelReady,
+              transferHandle == nil,
+              pendingTransfer == nil,
+              let recording = reconnectFetches.values.sorted(by: { $0.id < $1.id }).first
+        else { return }
+        uploadState = "Recorder reconnected — fetching queued audio…"
+        fetchRecording(recording)
+    }
+
+    private func suspendTransferForReconnect() {
+        guard let recording = pendingTransfer else { return }
+        try? transferHandle?.close()
+        transferHandle = nil
+        if let transferURL { try? FileManager.default.removeItem(at: transferURL) }
+        pendingTransfer = nil
+        transferURL = nil
+        transferFileKey = nil
+        transferNonce = nil
+        transferProgress = 0
+        reconnectFetches[recording.id] = recording
+        transferState = "Transfer interrupted — reconnecting"
+        uploadState = "Recorder connection interrupted — retrying automatically…"
+        if reconnectWaitLoggedIDs.insert(recording.id).inserted {
+            appendProcessingEvent(
+                recording: recording,
+                stage: .fetch,
+                state: .waiting,
+                title: "Transfer interrupted",
+                detail: "The Bluetooth link dropped. AnkerCore will reconnect and restart this recording transfer automatically."
+            )
         }
     }
 
@@ -1100,6 +1258,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 title: "Recording fetch failed",
                 detail: Self.safeTransferFailure(message)
             )
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.resumeReconnectFetchesIfReady()
         }
     }
 
@@ -1389,6 +1550,12 @@ extension BluetoothProbe: CBCentralManagerDelegate {
         @unknown default: "Unknown"
         }
         record(kind: "bluetooth", summary: "Central state: \(bluetoothState)")
+        if central.state == .poweredOn {
+            reconnectSavedRecorderIfNeeded()
+        } else {
+            reconnectWorkItem?.cancel()
+            reconnectWorkItem = nil
+        }
         objectWillChange.send()
     }
 
@@ -1427,6 +1594,12 @@ extension BluetoothProbe: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectAttempt = 0
+        userRequestedDisconnect = false
+        secureSession.reset()
+        rememberRecorder(peripheral)
         connectedPeripheral = peripheral
         connectedPeripheralID = peripheral.identifier
         connectionState = "Connected to \(peripheral.name ?? "device")"
@@ -1443,12 +1616,13 @@ extension BluetoothProbe: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
-        connectionState = "Connection failed"
+        connectionState = "Reconnect interrupted — retrying…"
         record(
             kind: "error",
             summary: "Connection failed: \(error?.localizedDescription ?? "unknown error")",
             peripheral: peripheral
         )
+        scheduleReconnect(to: peripheral)
     }
 
     func centralManager(
@@ -1456,17 +1630,24 @@ extension BluetoothProbe: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        if pendingTransfer != nil { failTransfer("Bluetooth disconnected") }
+        let shouldReconnect = !userRequestedDisconnect
+        userRequestedDisconnect = false
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        secureSession.reset()
+        suspendTransferForReconnect()
+        rememberRecorder(peripheral)
         connectedPeripheral = nil
         connectedPeripheralID = nil
         writeCharacteristic = nil
         recordingListState = "Connect to load recordings"
-        connectionState = "Disconnected"
+        connectionState = shouldReconnect ? "Reconnecting to Soundcore Work…" : "Disconnected"
         record(
             kind: error == nil ? "disconnect" : "error",
             summary: error?.localizedDescription ?? "Disconnected",
             peripheral: peripheral
         )
+        if shouldReconnect { scheduleReconnect(to: peripheral) }
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
@@ -1482,6 +1663,7 @@ extension BluetoothProbe: CBCentralManagerDelegate {
             )
             if !devices.contains(where: { $0.id == device.id }) { devices.append(device) }
             if peripheral.state == .connected {
+                rememberRecorder(peripheral)
                 connectedPeripheral = peripheral
                 connectedPeripheralID = peripheral.identifier
                 connectionState = "Restored connection to \(device.name)"
@@ -1550,6 +1732,10 @@ extension BluetoothProbe: CBPeripheralDelegate {
                 || characteristic.properties.contains(.writeWithoutResponse) {
                 writeCharacteristic = characteristic
                 recordingListState = "Ready to load recordings"
+                connectionState = "Connected to \(peripheral.name ?? "Soundcore Work")"
+                DispatchQueue.main.async { [weak self] in
+                    self?.resumeReconnectFetchesIfReady()
+                }
             }
             if characteristic.properties.contains(.read) {
                 peripheral.readValue(for: characteristic)

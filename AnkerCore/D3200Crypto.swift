@@ -24,6 +24,11 @@ final class D3200SecureSession {
 
     var isReady: Bool { sessionKey?.count == 32 }
 
+    func reset() {
+        privateKey = nil
+        sessionKey = nil
+    }
+
     func beginHandshake() -> Data {
         let key = P256.KeyAgreement.PrivateKey()
         privateKey = key

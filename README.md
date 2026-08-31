@@ -175,7 +175,7 @@ Before external testing or App Store release, complete the App Privacy, privacy-
 4. In AnkerCore, scan and connect to the Soundcore device.
 5. Make a short, non-sensitive test recording with the physical button.
 6. Press the button again to stop.
-7. Watch **Automatic flow**: AnkerCore fetches the file, transcribes it, routes it, and shows a link to the resulting Notion item.
+7. Watch **Automatic flow**: AnkerCore fetches the file, transcribes it, routes it, and shows a link to the resulting Notion item. If the Bluetooth link drops, the app keeps the recording queued, reconnects to the remembered recorder, rebuilds the encrypted session, and resumes the fetch automatically.
 8. Use **My tasks** to open or complete extracted actions without opening Notion.
 
 The first on-device transcription may download an Apple speech asset. If local speech or Apple Intelligence is unavailable, the status card clearly identifies the cloud fallback used.
@@ -262,7 +262,7 @@ Webhook URLs must use HTTPS, cannot contain URL-embedded usernames or passwords,
 
 ## Background behavior
 
-The app declares Bluetooth central background mode and uses state restoration. iOS can wake it for Bluetooth activity after it has been opened and connected. iOS will not relaunch an app that the user force-quits, so leave AnkerCore installed and do not swipe it away if you expect automatic fetching.
+The app declares Bluetooth central background mode and uses state restoration. It remembers the last recorder and automatically reconnects with backoff after an unexpected disconnect. Queued fetches survive an app relaunch through the protected processing log and resume after the command channel is rediscovered. Tapping **Disconnect** disables automatic reconnection until you explicitly connect again. iOS can wake the app for Bluetooth activity after it has been opened and connected, but it will not relaunch an app that the user force-quits, so do not swipe AnkerCore away if you expect automatic fetching.
 
 ## Security and privacy
 
