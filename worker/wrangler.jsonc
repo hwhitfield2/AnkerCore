@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ankercore-router",
+  "main": "index.js",
+  "compatibility_date": "2026-08-28",
+  "workers_dev": true,
+  "preview_urls": false,
+  "ai": {
+    "binding": "AI"
+  },
+  "observability": {
+    "enabled": false,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "vars": {
+    "ROOT_PAGE_ID": "REPLACE_WITH_NOTION_PARENT_PAGE_ID",
+    "INBOX_PAGE_ID": "REPLACE_AFTER_SETUP",
+    "MEETINGS_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "TASKS_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "IDEAS_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "RECENT_DATABASE_ID": "REPLACE_AFTER_SETUP",
+    "TIMEZONE_OFFSET": "-07:00",
+    "CLASSIFIER_MODEL": "@cf/meta/llama-3.2-1b-instruct",
+    "AI_CONFIDENCE_THRESHOLD": "0.68",
+    "AI_MAX_CHARS": "30000"
+  }
+}

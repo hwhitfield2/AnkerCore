@@ -1,0 +1,33 @@
+# Secrets and local Cloudflare state
+.dev.vars
+.env
+.env.*
+!.env.example
+.wrangler/
+worker/.wrangler/
+
+# Xcode and Swift
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint
+
+# Captured or generated media
+*.jsonl
+*.ogg
+*.opus
+*.opus.raw
+
+# macOS and editor files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Node
+node_modules/
+npm-debug.log*
