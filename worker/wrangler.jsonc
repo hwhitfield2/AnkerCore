@@ -6,7 +6,7 @@
   "workers_dev": true,
   "preview_urls": false,
   "triggers": {
-    "crons": ["0 14 * * *"]
+    "crons": ["* * * * *", "0 14 * * *"]
   },
   "ai": {
     "binding": "AI"

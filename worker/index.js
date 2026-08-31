@@ -95,8 +95,10 @@ export default {
     return json({ ok: true, accepted: true }, 202);
   },
 
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(createDailyDigest(env));
+  async scheduled(event, env, ctx) {
+    const jobs = [syncRecentlyEditedControlHub(env)];
+    if (event.cron === "0 14 * * *") jobs.push(createDailyDigest(env));
+    ctx.waitUntil(Promise.all(jobs));
   },
 };
 
@@ -1010,8 +1012,8 @@ async function syncRecentItem(recentPage, env, updatedPropertyIds = []) {
   if (!config?.databaseId) return;
 
   const relations = recentPage.properties?.[config.relation]?.relation || [];
-  // One Recent row can describe several extracted artifacts. Only sync when the
-  // user has selected an unambiguous control target with Type + one relation.
+  // A control row is safe to sync only when Type and its typed relation resolve
+  // to exactly one destination in the expected database.
   if (relations.length !== 1) return;
   const destination = await notion(env, `/pages/${relations[0].id}`);
   if (normalizeId(destination.parent?.database_id) !== normalizeId(config.databaseId)) return;
@@ -1081,6 +1083,75 @@ async function syncDestinationIntoRecent(destinationPage, recentPage, config, en
     method: "PATCH",
     body: JSON.stringify({ properties: changed }),
   });
+}
+
+export async function syncRecentlyEditedControlHub(env, options = {}) {
+  if (!env.RECENT_DATABASE_ID) return { recentToDestination: 0, destinationToRecent: 0, errors: 0 };
+
+  const lookbackMinutes = Math.max(2, Math.min(120, Number(options.lookbackMinutes || env.SYNC_LOOKBACK_MINUTES || 15)));
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const since = new Date(now - lookbackMinutes * 60 * 1000).toISOString();
+  const configs = [
+    { kind: "meeting", type: "Meeting", relation: "Meeting", databaseId: env.MEETINGS_DATABASE_ID },
+    { kind: "task", type: "Task", relation: "Tasks", databaseId: env.TASKS_DATABASE_ID },
+    { kind: "idea", type: "Idea", relation: "Ideas", databaseId: env.IDEAS_DATABASE_ID },
+  ].filter((config) => config.databaseId);
+
+  const recentPages = await listRecentlyEditedPages(env.RECENT_DATABASE_ID, since, env);
+  const recentById = new Map(recentPages.map((page) => [normalizeId(page.id), page]));
+  const destinationById = new Map();
+  for (const config of configs) {
+    for (const page of await listRecentlyEditedPages(config.databaseId, since, env)) {
+      destinationById.set(normalizeId(page.id), page);
+    }
+  }
+
+  const pairs = new Map();
+  for (const recentPage of recentPages) {
+    const config = configs.find((candidate) => candidate.type === recentPage.properties?.Type?.select?.name);
+    const relations = config ? recentPage.properties?.[config.relation]?.relation || [] : [];
+    if (!config || relations.length !== 1) continue;
+    try {
+      const destination = destinationById.get(normalizeId(relations[0].id))
+        || await notion(env, `/pages/${relations[0].id}`);
+      if (normalizeId(destination.parent?.database_id) !== normalizeId(config.databaseId)) continue;
+      pairs.set(`${normalizeId(recentPage.id)}:${normalizeId(destination.id)}`, { recentPage, destination, config });
+    } catch { /* A removed destination should not block other pairs. */ }
+  }
+
+  for (const destination of destinationById.values()) {
+    const config = artifactConfigForPage(destination, env);
+    const relations = destination.properties?.["Recent Item"]?.relation || [];
+    if (!config || relations.length !== 1) continue;
+    try {
+      const recentPage = recentById.get(normalizeId(relations[0].id))
+        || await notion(env, `/pages/${relations[0].id}`);
+      if (normalizeId(recentPage.parent?.database_id) !== normalizeId(env.RECENT_DATABASE_ID)) continue;
+      const typedRelations = recentPage.properties?.[config.relation]?.relation || [];
+      if (typedRelations.length !== 1 || normalizeId(typedRelations[0].id) !== normalizeId(destination.id)) continue;
+      pairs.set(`${normalizeId(recentPage.id)}:${normalizeId(destination.id)}`, { recentPage, destination, config });
+    } catch { /* A removed Recent row should not block other pairs. */ }
+  }
+
+  let recentToDestination = 0;
+  let destinationToRecent = 0;
+  let errors = 0;
+  for (const { recentPage, destination } of pairs.values()) {
+    try {
+      const recentEdited = Date.parse(recentPage.last_edited_time || "") || 0;
+      const destinationEdited = Date.parse(destination.last_edited_time || "") || 0;
+      if (recentEdited >= destinationEdited) {
+        await syncRecentItem(recentPage, env);
+        recentToDestination += 1;
+      } else {
+        await syncDestinationItem(destination, env);
+        destinationToRecent += 1;
+      }
+    } catch {
+      errors += 1;
+    }
+  }
+  return { recentToDestination, destinationToRecent, errors };
 }
 
 function artifactConfigForPage(page, env) {
@@ -1252,6 +1323,18 @@ async function listDatabasePages(databaseId, env, maximum = 500) {
     cursor = pages.length < maximum && data.has_more ? data.next_cursor : null;
   } while (cursor);
   return pages;
+}
+
+async function listRecentlyEditedPages(databaseId, since, env, maximum = 100) {
+  const data = await notion(env, `/databases/${databaseId}/query`, {
+    method: "POST",
+    body: JSON.stringify({
+      page_size: Math.min(100, maximum),
+      filter: { timestamp: "last_edited_time", last_edited_time: { on_or_after: since } },
+      sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
+    }),
+  });
+  return (data.results || []).slice(0, maximum).filter((page) => !page.archived);
 }
 
 function notionPageIdFromURL(value) {

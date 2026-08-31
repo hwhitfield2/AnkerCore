@@ -218,6 +218,8 @@ Recent Items is the central operating table. Every routed meeting, task, or idea
 
 Edits synchronize in both directions through the signed Notion webhook. **Name**, **Item Status**, **Area**, **Summary**, **Project**, and **Client** are shared by every artifact type. Meetings additionally mirror **People**; tasks mirror **Task Status** for backward compatibility plus **Priority**, **Due**, and **Owner**. Changes made in Recent Items update the linked Meetings, Tasks, or Ideas row, and changes made in a destination database update Recent Items. The Worker compares normalized property values before writing, so its own webhook events converge without a recursive update loop. Processing **Status** remains operational metadata and is never copied to an artifact.
 
+The Worker also reconciles recently edited control rows once per minute. This fallback uses Notion's `last_edited_time` on both linked pages so the newer side wins, covering delayed, paused, or legacy webhook subscriptions without changing the normal webhook fast path.
+
 Changing **Type** or relation fields does not move a page between databases. The Worker only writes through an exact, single typed relation whose destination belongs to the configured database. Editing destination-only fields such as meeting decisions, task source quotes, or idea experiments still happens in the native database.
 
 Running **Upgrade existing AnkerCore databases** through `/setup` performs a full historical reconciliation. It adds the shared fields, splits legacy multi-artifact Recent rows into one row per artifact, repairs typed relations and backlinks, and refreshes all mirrors from their destination rows. Reconciliation is capped at 500 rows per database per run and never deletes Notion content.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker, { backfillRecentRelations } from "./index.js";
+import worker, { backfillRecentRelations, syncRecentlyEditedControlHub } from "./index.js";
 
 const ids = {
   inbox: "11111111-1111-1111-1111-111111111111",
@@ -384,6 +384,74 @@ test("editing a destination task mirrors its workflow fields back to Recent Item
     assert.equal(mirrored.Priority.select.name, "Urgent");
     assert.equal(mirrored.Due.date.start, "2026-09-03");
     assert.deepEqual(mirrored.Project.relation, [{ id: projectPageId }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scheduled reconciliation applies a newer Recent Item status to its task", async () => {
+  const originalFetch = globalThis.fetch;
+  const recentPageId = "81818181-8181-8181-8181-818181818181";
+  const taskPageId = "82828282-8282-8282-8282-828282828282";
+  const patches = [];
+  const recentPage = {
+    id: recentPageId,
+    parent: { database_id: ids.recent },
+    last_edited_time: "2026-08-31T19:10:00.000Z",
+    properties: {
+      Name: { title: [{ plain_text: "Wire bandwidth to Porter IQ" }] },
+      Type: { select: { name: "Task" } },
+      Area: { select: { name: "Work" } },
+      Summary: { rich_text: [{ plain_text: "Wire bandwidth to Porter IQ." }] },
+      Tasks: { relation: [{ id: taskPageId }] },
+      "Item Status": { status: { name: "In progress" } },
+      Priority: { select: { name: "Medium" } },
+      Due: { date: null },
+      Owner: { rich_text: [] },
+      Project: { relation: [] },
+      Client: { relation: [] },
+    },
+  };
+  const taskPage = {
+    id: taskPageId,
+    parent: { database_id: ids.tasks },
+    last_edited_time: "2026-08-31T19:00:00.000Z",
+    properties: {
+      Name: { title: [{ plain_text: "Wire bandwidth to Porter IQ" }] },
+      Status: { status: { name: "Not started" } },
+      "Recent Item": { relation: [{ id: recentPageId }] },
+    },
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const queryMatch = url.pathname.match(/\/databases\/([^/]+)\/query$/);
+    if (queryMatch && init.method === "POST") {
+      const databaseId = queryMatch[1];
+      if (databaseId === ids.recent) return response({ results: [recentPage] });
+      return response({ results: [] });
+    }
+    if (url.pathname.endsWith(`/pages/${taskPageId}`) && !init.method) return response(taskPage);
+    if (url.pathname.endsWith(`/pages/${taskPageId}`) && init.method === "PATCH") {
+      const body = JSON.parse(init.body);
+      patches.push(body);
+      return response({ ...taskPage, properties: { ...taskPage.properties, ...body.properties } });
+    }
+    if (url.pathname.endsWith(`/pages/${recentPageId}`) && init.method === "PATCH") {
+      const body = JSON.parse(init.body);
+      return response({ ...recentPage, properties: { ...recentPage.properties, ...body.properties } });
+    }
+    throw new Error(`Unexpected Notion request: ${init.method || "GET"} ${url.pathname}`);
+  };
+
+  try {
+    const result = await syncRecentlyEditedControlHub(environment(), {
+      now: Date.parse("2026-08-31T19:12:00.000Z"),
+      lookbackMinutes: 15,
+    });
+    assert.deepEqual(result, { recentToDestination: 1, destinationToRecent: 0, errors: 0 });
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].properties.Status.status.name, "In progress");
   } finally {
     globalThis.fetch = originalFetch;
   }
