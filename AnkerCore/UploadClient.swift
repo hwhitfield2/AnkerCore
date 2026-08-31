@@ -98,6 +98,9 @@ enum AnkerCoreUploadError: LocalizedError {
 struct AnkerCoreUploadClient {
     static let defaultEndpoint = ""
 
+    private static let legacyProductionHost = "soundcore-notion-router.hwhitfield2.workers.dev"
+    private static let productionEndpoint = "https://ankercore-api.glucocore.app/audio"
+
     private static let endpointKey = "ankercore.upload.endpoint"
     private static let legacyEndpointKey = "soundcore.upload.endpoint"
     private static let keychainService = "app.ankercore.credentials"
@@ -106,9 +109,14 @@ struct AnkerCoreUploadClient {
     private static let webhookAccount = "optional-delivery-webhook"
 
     static var savedEndpoint: String {
-        UserDefaults.standard.string(forKey: endpointKey)
+        let configured = UserDefaults.standard.string(forKey: endpointKey)
             ?? UserDefaults.standard.string(forKey: legacyEndpointKey)
             ?? defaultEndpoint
+        guard let url = URL(string: configured), url.host?.lowercased() == legacyProductionHost else {
+            return configured
+        }
+        UserDefaults.standard.set(productionEndpoint, forKey: endpointKey)
+        return productionEndpoint
     }
 
     static var hasToken: Bool { (try? readToken()) != nil }

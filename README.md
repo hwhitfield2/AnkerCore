@@ -209,6 +209,8 @@ The iPhone app also keeps a separate per-recording processing timeline. The Rela
 
 Settings includes **Test connection**, which authenticates to the Worker and performs a read-only validation of the configured Notion routing schemas. The check runs automatically after saving a connection and at launch; it never uploads audio or transcript text. Routing failures distinguish invalid credentials, network/DNS/TLS failures, Notion access loss, missing targets, rate limits, and schema mismatches without exposing response bodies or secrets.
 
+For the production TestFlight installation, the Worker is also available at `https://ankercore-api.glucocore.app/audio` so networks that block `.workers.dev` do not interrupt processing. Existing installations configured with the legacy production hostname migrate to this custom endpoint automatically; self-hosted endpoints are never changed.
+
 The Worker cron in `wrangler.jsonc` creates an idempotent Daily Digest at 14:00 UTC (07:00 in Arizona) with open, due, overdue, and needs-review actions. Change the cron for another local time. An authenticated `POST /digest` can generate today's digest on demand.
 
 When a user corrects the Area on a routed Notion page, the signed Notion `page.properties_updated` webhook records the correction in Routing Feedback. Learned corrections are supplied as untrusted examples to later cloud classifications, creating an auditable feedback loop without modifying or uploading voice profiles.
