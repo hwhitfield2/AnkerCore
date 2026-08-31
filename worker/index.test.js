@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker from "./index.js";
+import worker, { backfillRecentRelations } from "./index.js";
 
 const ids = {
   inbox: "11111111-1111-1111-1111-111111111111",
@@ -303,6 +303,73 @@ test("editing one linked task in Recent Items updates only its destination", asy
     assert.equal(patches[0].properties.Status.status.name, "In progress");
     assert.equal(patches[0].properties.Priority.select.name, "High");
     assert.equal(patches[0].properties.Due.date.start, "2026-09-02");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reconciliation links every historical artifact sharing a source", async () => {
+  const originalFetch = globalThis.fetch;
+  const source = "https://www.notion.so/source-1234567890abcdef1234567890abcdef";
+  const recentPageId = "10101010-1010-1010-1010-101010101010";
+  const meetingPageId = "20202020-2020-2020-2020-202020202020";
+  const taskPageId = "30303030-3030-3030-3030-303030303030";
+  const ideaPageId = "40404040-4040-4040-4040-404040404040";
+  const patches = [];
+  const page = (id, name, properties = {}) => ({
+    id,
+    url: `https://www.notion.so/${name.replaceAll(" ", "-")}-${id.replaceAll("-", "")}`,
+    created_time: "2026-08-31T17:00:00Z",
+    properties: {
+      Name: { title: [{ plain_text: name }] },
+      Source: { url: source },
+      Area: { select: { name: "Work" } },
+      Summary: { rich_text: [{ plain_text: `${name} summary` }] },
+      "AI Confidence": { number: 0.9 },
+      ...properties,
+    },
+  });
+  const pagesByDatabase = {
+    [ids.recent]: [{
+      id: recentPageId,
+      properties: {
+        Source: { url: source },
+        Type: { select: { name: "Meeting" } },
+        Destination: { url: `https://www.notion.so/meeting-${meetingPageId.replaceAll("-", "")}` },
+      },
+    }],
+    [ids.meetings]: [page(meetingPageId, "Launch meeting")],
+    [ids.tasks]: [page(taskPageId, "Send launch plan", {
+      Status: { status: { name: "In progress" } },
+      Priority: { select: { name: "High" } },
+      Owner: { rich_text: [{ plain_text: "Hayden" }] },
+    })],
+    [ids.ideas]: [page(ideaPageId, "Staged launch")],
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const queryMatch = url.pathname.match(/\/databases\/([0-9a-f-]+)\/query$/i);
+    if (queryMatch && init.method === "POST") return response({ results: pagesByDatabase[queryMatch[1]] || [], has_more: false });
+    const patchMatch = url.pathname.match(/\/pages\/([0-9a-f-]+)$/i);
+    if (patchMatch && init.method === "PATCH") {
+      patches.push({ id: patchMatch[1], body: JSON.parse(init.body) });
+      return response({ id: patchMatch[1] });
+    }
+    throw new Error(`Unexpected Notion request: ${init.method || "GET"} ${url.pathname}`);
+  };
+
+  try {
+    const result = await backfillRecentRelations(environment());
+    assert.deepEqual(result, { recent: 1, destinations: 3, errors: 0 });
+    const recentPatch = patches.find((entry) => entry.id === recentPageId).body.properties;
+    assert.deepEqual(recentPatch.Meeting.relation, [{ id: meetingPageId }]);
+    assert.deepEqual(recentPatch.Tasks.relation, [{ id: taskPageId }]);
+    assert.deepEqual(recentPatch.Ideas.relation, [{ id: ideaPageId }]);
+    assert.equal(recentPatch.Name.title[0].text.content, "Launch meeting");
+    for (const id of [meetingPageId, taskPageId, ideaPageId]) {
+      assert.deepEqual(patches.find((entry) => entry.id === id).body.properties["Recent Item"].relation, [{ id: recentPageId }]);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }

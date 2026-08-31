@@ -469,7 +469,7 @@ async function provisionDatabases(inbox, hub, env) {
     Summary: { rich_text: {} }, Meeting: relationProperty(meetings.id), Tasks: relationProperty(tasks.id), Ideas: relationProperty(ideas.id),
     "Task Status": { status: {} }, Priority: priorityProperty(), Due: { date: {} }, Owner: { rich_text: {} },
   }, env);
-  await backfillRecentRelations({ ...env, RECENT_DATABASE_ID: recent.id, MEETINGS_DATABASE_ID: meetings.id, TASKS_DATABASE_ID: tasks.id, IDEAS_DATABASE_ID: ideas.id });
+  const reconciliation = await backfillRecentRelations({ ...env, RECENT_DATABASE_ID: recent.id, MEETINGS_DATABASE_ID: meetings.id, TASKS_DATABASE_ID: tasks.id, IDEAS_DATABASE_ID: ideas.id });
   return {
     INBOX_PAGE_ID: inbox.id,
     MEETINGS_DATABASE_ID: meetings.id,
@@ -483,6 +483,9 @@ async function provisionDatabases(inbox, hub, env) {
     DIGESTS_DATABASE_ID: digests.id,
     FEEDBACK_DATABASE_ID: feedback.id,
     INBOX_URL: inbox.url,
+    RECONCILED_RECENT: reconciliation.recent,
+    RECONCILED_DESTINATIONS: reconciliation.destinations,
+    RECONCILIATION_ERRORS: reconciliation.errors,
   };
 }
 
@@ -963,58 +966,139 @@ async function syncRecentItem(recentPage, env) {
   });
 }
 
-async function backfillRecentRelations(env) {
-  if (!env.RECENT_DATABASE_ID) return;
-  let cursor;
-  let scanned = 0;
-  do {
-    const body = { page_size: 100 };
-    if (cursor) body.start_cursor = cursor;
-    const data = await notion(env, `/databases/${env.RECENT_DATABASE_ID}/query`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    for (const recentPage of data.results || []) {
-      if (++scanned > 500) return;
-      try {
-        const type = recentPage.properties?.Type?.select?.name || "";
-        const config = {
-          Meeting: { relation: "Meeting", databaseId: env.MEETINGS_DATABASE_ID },
-          Task: { relation: "Tasks", databaseId: env.TASKS_DATABASE_ID },
-          Idea: { relation: "Ideas", databaseId: env.IDEAS_DATABASE_ID },
-        }[type];
-        const destinationId = notionPageIdFromURL(recentPage.properties?.Destination?.url);
-        if (!config?.databaseId || !destinationId) continue;
-        const destination = await notion(env, `/pages/${destinationId}`);
-        if (normalizeId(destination.parent?.database_id) !== normalizeId(config.databaseId)) continue;
+export async function backfillRecentRelations(env) {
+  if (!env.RECENT_DATABASE_ID) return { recent: 0, destinations: 0, errors: 0 };
+  const configs = [
+    { kind: "meeting", type: "Meeting", relation: "Meeting", databaseId: env.MEETINGS_DATABASE_ID },
+    { kind: "task", type: "Task", relation: "Tasks", databaseId: env.TASKS_DATABASE_ID },
+    { kind: "idea", type: "Idea", relation: "Ideas", databaseId: env.IDEAS_DATABASE_ID },
+  ].filter((config) => config.databaseId);
 
-        const properties = {
-          [config.relation]: { relation: [{ id: destination.id }] },
-          Summary: editableRichTextProperty(propertyText(destination.properties?.Summary), 1900),
-        };
-        if (type === "Task") {
-          const taskProperties = destination.properties || {};
-          const status = cleanAiText(taskProperties.Status?.status?.name, 100);
-          if (status) properties["Task Status"] = { status: { name: status } };
-          properties.Priority = taskProperties.Priority?.select?.name
-            ? { select: { name: taskProperties.Priority.select.name } }
-            : { select: null };
-          properties.Due = taskProperties.Due?.date?.start
-            ? { date: { start: taskProperties.Due.date.start } }
-            : { date: null };
-          properties.Owner = editableRichTextProperty(propertyText(taskProperties.Owner), 120);
-        }
-        await notion(env, `/pages/${recentPage.id}`, { method: "PATCH", body: JSON.stringify({ properties }) });
-        await notion(env, `/pages/${destination.id}`, {
+  const recentPages = await listDatabasePages(env.RECENT_DATABASE_ID, env);
+  const recentBySource = new Map();
+  for (const page of recentPages) {
+    const source = page.properties?.Source?.url || "";
+    if (source && !recentBySource.has(source)) recentBySource.set(source, page);
+  }
+
+  const grouped = new Map();
+  for (const config of configs) {
+    for (const page of await listDatabasePages(config.databaseId, env)) {
+      if (page.archived) continue;
+      const source = page.properties?.Source?.url || "";
+      if (!source) continue;
+      const items = grouped.get(source) || [];
+      items.push({ ...config, page });
+      grouped.set(source, items);
+    }
+  }
+
+  let reconciledRecent = 0;
+  let reconciledDestinations = 0;
+  let errors = 0;
+  for (const [source, items] of grouped) {
+    try {
+      let recentPage = recentBySource.get(source) || null;
+      const requestedId = notionPageIdFromURL(recentPage?.properties?.Destination?.url);
+      const requestedType = recentPage?.properties?.Type?.select?.name || "";
+      const primary = items.find((item) => normalizeId(item.page.id) === normalizeId(requestedId))
+        || items.find((item) => item.type === requestedType)
+        || items[0];
+      if (!primary) continue;
+
+      if (!recentPage) {
+        recentPage = await notion(env, "/pages", {
+          method: "POST",
+          body: JSON.stringify({
+            parent: { database_id: env.RECENT_DATABASE_ID },
+            properties: {
+              Name: titleProperty(propertyText(primary.page.properties?.Name) || "Recovered AnkerCore item"),
+              Status: { select: { name: "Processed" } },
+              Source: { url: source },
+            },
+          }),
+        });
+        recentBySource.set(source, recentPage);
+      }
+
+      await notion(env, `/pages/${recentPage.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ properties: recentMirrorProperties(primary, items, source) }),
+      });
+      reconciledRecent += 1;
+
+      for (const item of items) {
+        await notion(env, `/pages/${item.page.id}`, {
           method: "PATCH",
           body: JSON.stringify({ properties: { "Recent Item": { relation: [{ id: recentPage.id }] } } }),
         });
-      } catch {
-        // Stale URLs or removed rows should not block the rest of the migration.
+        reconciledDestinations += 1;
       }
+    } catch {
+      // A removed row or malformed legacy property must not block other sources.
+      errors += 1;
     }
-    cursor = data.has_more ? data.next_cursor : null;
+  }
+  return { recent: reconciledRecent, destinations: reconciledDestinations, errors };
+}
+
+async function listDatabasePages(databaseId, env, maximum = 500) {
+  const pages = [];
+  let cursor;
+  do {
+    const body = { page_size: Math.min(100, maximum - pages.length) };
+    if (cursor) body.start_cursor = cursor;
+    const data = await notion(env, `/databases/${databaseId}/query`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    pages.push(...(data.results || []).slice(0, maximum - pages.length));
+    cursor = pages.length < maximum && data.has_more ? data.next_cursor : null;
   } while (cursor);
+  return pages;
+}
+
+function recentMirrorProperties(primary, items, source) {
+  const sourceProperties = primary.page.properties || {};
+  const properties = {
+    Name: titleProperty(propertyText(sourceProperties.Name) || "Recovered AnkerCore item"),
+    Type: { select: { name: primary.type } },
+    Summary: editableRichTextProperty(propertyText(sourceProperties.Summary), 1900),
+    Database: { url: `https://app.notion.com/p/${normalizeId(primary.databaseId)}` },
+    Destination: { url: primary.page.url || `https://www.notion.so/${normalizeId(primary.page.id)}` },
+    Source: { url: source },
+  };
+  for (const config of [
+    { kind: "meeting", relation: "Meeting" },
+    { kind: "task", relation: "Tasks" },
+    { kind: "idea", relation: "Ideas" },
+  ]) {
+    properties[config.relation] = {
+      relation: items.filter((item) => item.kind === config.kind).slice(0, 100).map((item) => ({ id: item.page.id })),
+    };
+  }
+
+  const area = sourceProperties.Area?.select?.name || "";
+  if (["Work", "Personal Life", "Personal Work", "Needs Review"].includes(area)) {
+    properties.Area = { select: { name: area } };
+  }
+  const confidence = sourceProperties["AI Confidence"]?.number;
+  if (Number.isFinite(confidence)) properties["AI Confidence"] = { number: confidence };
+  const recorded = sourceProperties.Recorded?.date?.start || primary.page.created_time || "";
+  if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(recorded)) properties.Recorded = { date: { start: recorded } };
+
+  if (primary.kind === "task") {
+    const status = cleanAiText(sourceProperties.Status?.status?.name, 100);
+    if (status) properties["Task Status"] = { status: { name: status } };
+    const priority = sourceProperties.Priority?.select?.name || "";
+    properties.Priority = ["Low", "Medium", "High", "Urgent"].includes(priority)
+      ? { select: { name: priority } }
+      : { select: null };
+    const due = sourceProperties.Due?.date?.start || "";
+    properties.Due = /^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(due) ? { date: { start: due } } : { date: null };
+    properties.Owner = editableRichTextProperty(propertyText(sourceProperties.Owner), 120);
+  }
+  return properties;
 }
 
 function notionPageIdFromURL(value) {

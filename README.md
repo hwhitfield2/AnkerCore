@@ -110,7 +110,7 @@ Visit `https://YOUR-WORKER.workers.dev/setup`, enter the temporary setup key, an
 - Daily Digests
 - Routing Feedback
 
-Copy every returned ID into its matching field in `worker/wrangler.jsonc`. Existing installations can deploy the new Worker temporarily with `SETUP_KEY`, visit `/setup`, and choose **Upgrade existing AnkerCore databases**; rows are retained while the new databases, properties, and relations are added.
+Copy each returned database/page ID into its matching field in `worker/wrangler.jsonc`. The reconciliation counters are informational and do not belong in the configuration. Existing installations can deploy the new Worker temporarily with `SETUP_KEY`, visit `/setup`, and choose **Upgrade existing AnkerCore databases**; rows are retained while the new databases, properties, and relations are added.
 
 ```bash
 npm run deploy
@@ -222,7 +222,7 @@ Each Recent Items row is linked to all Meetings, Tasks, and Ideas extracted from
 
 Edits to **Name**, **Area**, and **Summary** in Recent Items are copied to that selected destination by the signed Notion webhook. A Task also synchronizes **Task Status**, **Priority**, **Due**, and **Owner**. Processing **Status** remains operational metadata and is never copied. When a recording produces multiple tasks or ideas, set the matching relation to exactly one row before editing; AnkerCore intentionally refuses ambiguous multi-row updates. Changing **Type** selects another already-linked artifact—it does not move or recreate records between databases.
 
-This is a guarded one-way edit path from Recent Items to the destination databases. Editing destination-only fields such as meeting decisions, task source quotes, or idea experiments still happens in their native database. After upgrading an existing installation through `/setup`, AnkerCore backfills links for older Recent rows when their saved destination URL is still valid.
+This is a guarded one-way edit path from Recent Items to the destination databases. Editing destination-only fields such as meeting decisions, task source quotes, or idea experiments still happens in their native database. Running **Upgrade existing AnkerCore databases** through `/setup` performs a full historical reconciliation: it groups routed artifacts by Source, repairs every typed relation and backlink, refreshes mirror fields from the selected destination, and creates a Recent row for older routed content that never received one. Reconciliation is capped at 500 rows per database per run and never deletes Notion content.
 
 Settings includes **Test connection**, which authenticates to the Worker and performs a read-only validation of the configured Notion routing schemas. The check runs automatically after saving a connection and at launch; it never uploads audio or transcript text. Routing failures distinguish invalid credentials, network/DNS/TLS failures, Notion access loss, missing targets, rate limits, and schema mismatches without exposing response bodies or secrets.
 
