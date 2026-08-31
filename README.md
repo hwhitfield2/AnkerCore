@@ -214,15 +214,13 @@ The **AnkerCore Relay** home-screen widget mirrors up to 20 recent recording sta
 
 ## Recent Items as the control surface
 
-Each Recent Items row is linked to all Meetings, Tasks, and Ideas extracted from that recording. The destination rows also link back through **Recent Item**. The row's **Type** selects the editable control target:
+Recent Items is the central operating table. Every routed meeting, task, or idea gets its own Recent Items row with exactly one typed relation and a backlink from the destination row. A recording that creates one meeting, three tasks, and an idea therefore creates five unambiguous control rows rather than one overloaded row.
 
-- **Meeting** + exactly one **Meeting** relation
-- **Task** + exactly one **Tasks** relation
-- **Idea** + exactly one **Ideas** relation
+Edits synchronize in both directions through the signed Notion webhook. **Name**, **Item Status**, **Area**, **Summary**, **Project**, and **Client** are shared by every artifact type. Meetings additionally mirror **People**; tasks mirror **Task Status** for backward compatibility plus **Priority**, **Due**, and **Owner**. Changes made in Recent Items update the linked Meetings, Tasks, or Ideas row, and changes made in a destination database update Recent Items. The Worker compares normalized property values before writing, so its own webhook events converge without a recursive update loop. Processing **Status** remains operational metadata and is never copied to an artifact.
 
-Edits to **Name**, **Area**, and **Summary** in Recent Items are copied to that selected destination by the signed Notion webhook. A Task also synchronizes **Task Status**, **Priority**, **Due**, and **Owner**. Processing **Status** remains operational metadata and is never copied. When a recording produces multiple tasks or ideas, set the matching relation to exactly one row before editing; AnkerCore intentionally refuses ambiguous multi-row updates. Changing **Type** selects another already-linked artifact—it does not move or recreate records between databases.
+Changing **Type** or relation fields does not move a page between databases. The Worker only writes through an exact, single typed relation whose destination belongs to the configured database. Editing destination-only fields such as meeting decisions, task source quotes, or idea experiments still happens in the native database.
 
-This is a guarded one-way edit path from Recent Items to the destination databases. Editing destination-only fields such as meeting decisions, task source quotes, or idea experiments still happens in their native database. Running **Upgrade existing AnkerCore databases** through `/setup` performs a full historical reconciliation: it groups routed artifacts by Source, repairs every typed relation and backlink, refreshes mirror fields from the selected destination, and creates a Recent row for older routed content that never received one. Reconciliation is capped at 500 rows per database per run and never deletes Notion content.
+Running **Upgrade existing AnkerCore databases** through `/setup` performs a full historical reconciliation. It adds the shared fields, splits legacy multi-artifact Recent rows into one row per artifact, repairs typed relations and backlinks, and refreshes all mirrors from their destination rows. Reconciliation is capped at 500 rows per database per run and never deletes Notion content.
 
 Settings includes **Test connection**, which authenticates to the Worker and performs a read-only validation of the configured Notion routing schemas. The check runs automatically after saving a connection and at launch; it never uploads audio or transcript text. Routing failures distinguish invalid credentials, network/DNS/TLS failures, Notion access loss, missing targets, rate limits, and schema mismatches without exposing response bodies or secrets.
 

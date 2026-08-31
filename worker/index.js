@@ -77,7 +77,10 @@ export default {
     if (!pageId) return json({ ok: true, ignored: true });
 
     if (event.type === "page.properties_updated") {
-      ctx.waitUntil(handlePropertiesUpdated(pageId, env));
+      const updatedProperties = Array.isArray(event.data?.updated_properties)
+        ? event.data.updated_properties.filter((value) => typeof value === "string").slice(0, 100)
+        : [];
+      ctx.waitUntil(handlePropertiesUpdated(pageId, env, updatedProperties));
       return json({ ok: true, accepted: true }, 202);
     }
 
@@ -385,7 +388,7 @@ async function provisionDatabases(inbox, hub, env) {
     Client: relationProperty(clients.id),
   }, env);
   const meetings = await createDatabase(hub.id, "Meetings", {
-    Name: { title: {} }, Recorded: { date: {} }, Participants: { rich_text: {} }, Summary: { rich_text: {} },
+    Name: { title: {} }, Status: { status: {} }, Recorded: { date: {} }, Participants: { rich_text: {} }, Summary: { rich_text: {} },
     Decisions: { rich_text: {} }, "Open Questions": { rich_text: {} }, "Follow-up": { rich_text: {} },
     Area: areaProperty(), "AI Area": areaProperty(), "AI Type": artifactTypeProperty(), "AI Confidence": { number: { format: "percent" } }, Source: { url: {} }, "Artifact Key": { rich_text: {} },
     People: relationProperty(people.id), Project: relationProperty(projects.id), Client: relationProperty(clients.id),
@@ -397,7 +400,7 @@ async function provisionDatabases(inbox, hub, env) {
     Project: relationProperty(projects.id), Client: relationProperty(clients.id), "Origin Meeting": relationProperty(meetings.id),
   }, env);
   const ideas = await createDatabase(hub.id, "Ideas", {
-    Name: { title: {} }, Recorded: { date: {} }, Topic: { select: { options: [] } }, Summary: { rich_text: {} },
+    Name: { title: {} }, Status: { status: {} }, Recorded: { date: {} }, Topic: { select: { options: [] } }, Summary: { rich_text: {} },
     "Why It Matters": { rich_text: {} }, "Next Experiment": { rich_text: {} }, Area: areaProperty(), "AI Area": areaProperty(), "AI Type": artifactTypeProperty(),
     "AI Confidence": { number: { format: "percent" } }, Source: { url: {} }, "Artifact Key": { rich_text: {} },
     Project: relationProperty(projects.id), Client: relationProperty(clients.id),
@@ -435,10 +438,15 @@ async function provisionDatabases(inbox, hub, env) {
     Meeting: relationProperty(meetings.id),
     Tasks: relationProperty(tasks.id),
     Ideas: relationProperty(ideas.id),
+    "Item Status": { status: {} },
     "Task Status": { status: {} },
     Priority: priorityProperty(),
     Due: { date: {} },
     Owner: { rich_text: {} },
+    Project: relationProperty(projects.id),
+    Client: relationProperty(clients.id),
+    People: relationProperty(people.id),
+    "Artifact Key": { rich_text: {} },
     Database: { url: {} },
     Destination: { url: {} },
     Source: { url: {} },
@@ -448,7 +456,7 @@ async function provisionDatabases(inbox, hub, env) {
   // Existing installs are upgraded in place. Notion retains all rows while new
   // properties and relations are added to their schemas.
   await ensureDatabaseProperties(meetings.id, {
-    Decisions: { rich_text: {} }, "Open Questions": { rich_text: {} }, "Follow-up": { rich_text: {} }, "Artifact Key": { rich_text: {} },
+    Status: { status: {} }, Decisions: { rich_text: {} }, "Open Questions": { rich_text: {} }, "Follow-up": { rich_text: {} }, "Artifact Key": { rich_text: {} },
     "AI Area": areaProperty(), "AI Type": artifactTypeProperty(),
     People: relationProperty(people.id), Project: relationProperty(projects.id), Client: relationProperty(clients.id),
     "Recent Item": relationProperty(recent.id),
@@ -460,14 +468,15 @@ async function provisionDatabases(inbox, hub, env) {
     "Recent Item": relationProperty(recent.id),
   }, env);
   await ensureDatabaseProperties(ideas.id, {
-    "Why It Matters": { rich_text: {} }, "Next Experiment": { rich_text: {} }, "Artifact Key": { rich_text: {} },
+    Status: { status: {} }, "Why It Matters": { rich_text: {} }, "Next Experiment": { rich_text: {} }, "Artifact Key": { rich_text: {} },
     "AI Area": areaProperty(), "AI Type": artifactTypeProperty(),
     Project: relationProperty(projects.id), Client: relationProperty(clients.id),
     "Recent Item": relationProperty(recent.id),
   }, env);
   await ensureDatabaseProperties(recent.id, {
     Summary: { rich_text: {} }, Meeting: relationProperty(meetings.id), Tasks: relationProperty(tasks.id), Ideas: relationProperty(ideas.id),
-    "Task Status": { status: {} }, Priority: priorityProperty(), Due: { date: {} }, Owner: { rich_text: {} },
+    "Item Status": { status: {} }, "Task Status": { status: {} }, Priority: priorityProperty(), Due: { date: {} }, Owner: { rich_text: {} },
+    Project: relationProperty(projects.id), Client: relationProperty(clients.id), People: relationProperty(people.id), "Artifact Key": { rich_text: {} },
   }, env);
   const reconciliation = await backfillRecentRelations({ ...env, RECENT_DATABASE_ID: recent.id, MEETINGS_DATABASE_ID: meetings.id, TASKS_DATABASE_ID: tasks.id, IDEAS_DATABASE_ID: ideas.id });
   return {
@@ -599,6 +608,7 @@ async function routePage(pageId, env, suppliedAnalysis = null, options = {}) {
       if (!meetingPage) {
         const meeting = analysis.meeting;
         const properties = commonRoutedProperties(meeting.title || initialTitle, source, analysis, artifactKey, "Meeting");
+        properties.Status = { status: { name: "Not started" } };
         properties.Recorded = { date: { start: recorded } };
         properties.Participants = richTextProperty(meeting.participants.join(", "));
         properties.Decisions = richTextProperty(meeting.decisions.join("\n"));
@@ -634,6 +644,7 @@ async function routePage(pageId, env, suppliedAnalysis = null, options = {}) {
       let ideaPage = await findByArtifactKey(env.IDEAS_DATABASE_ID, artifactKey, env);
       if (!ideaPage) {
         const properties = commonRoutedProperties(idea.title, source, analysis, artifactKey, "Idea");
+        properties.Status = { status: { name: "Not started" } };
         properties.Recorded = { date: { start: recorded } };
         if (idea.topic) properties.Topic = { select: { name: idea.topic } };
         properties["Why It Matters"] = richTextProperty(idea.whyItMatters);
@@ -744,11 +755,13 @@ async function finishRecentItem(pageId, result, env) {
   if (typeof result.summary === "string") properties.Summary = richTextProperty(result.summary);
   if (result.database) properties.Database = { url: result.database };
   if (result.destination) properties.Destination = { url: result.destination };
+  const primary = (result.destinations || []).find((item) => item.destination === result.destination)
+    || (result.destinations || [])[0];
   const relationNames = { meeting: "Meeting", task: "Tasks", idea: "Ideas" };
-  for (const kind of Object.keys(relationNames)) {
-    const related = (result.destinations || []).filter((item) => item.kind === kind && item.page_id);
-    if (related.length) properties[relationNames[kind]] = { relation: related.map((item) => ({ id: item.page_id })) };
+  for (const [kind, relation] of Object.entries(relationNames)) {
+    properties[relation] = { relation: primary?.kind === kind && primary.page_id ? [{ id: primary.page_id }] : [] };
   }
+  if (primary) properties["Item Status"] = { status: { name: "Not started" } };
   if (result.task) {
     properties["Task Status"] = { status: { name: "Not started" } };
     properties.Priority = { select: { name: result.task.priority } };
@@ -757,19 +770,86 @@ async function finishRecentItem(pageId, result, env) {
   }
   try {
     await notion(env, `/pages/${pageId}`, { method: "PATCH", body: JSON.stringify({ properties }) });
-    for (const destination of result.destinations || []) {
-      if (!destination.page_id) continue;
-      try {
-        await notion(env, `/pages/${destination.page_id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ properties: { "Recent Item": { relation: [{ id: pageId }] } } }),
-        });
-      } catch {
-        // A missing backlink must not turn successful routing into a failure.
-      }
-    }
+    await ensureRecentRowsForDestinations(result.destinations || [], primary?.page_id, pageId, env);
   } catch {
     // The routed item is authoritative; a dashboard update must never block it.
+  }
+}
+
+async function ensureRecentRowsForDestinations(destinations, primaryDestinationId, primaryRecentId, env) {
+  for (const destination of destinations) {
+    if (!destination.page_id) continue;
+    try {
+      const destinationPage = await notion(env, `/pages/${destination.page_id}`);
+      const config = artifactConfigForPage(destinationPage, env);
+      if (!config) continue;
+      const preferredRecentId = normalizeId(destination.page_id) === normalizeId(primaryDestinationId) ? primaryRecentId : "";
+      const recentPage = await findOrCreateRecentForDestination(destinationPage, config, preferredRecentId, env);
+      await linkAndMirrorRecentDestination(recentPage, destinationPage, config, env);
+    } catch {
+      // A later reconciliation or webhook event can repair a dashboard link.
+    }
+  }
+}
+
+async function findOrCreateRecentForDestination(destinationPage, config, preferredRecentId, env) {
+  if (preferredRecentId) {
+    const preferred = await notion(env, `/pages/${preferredRecentId}`);
+    if (normalizeId(preferred.parent?.database_id) === normalizeId(env.RECENT_DATABASE_ID)) return preferred;
+  }
+
+  const artifactKey = cleanAiText(propertyText(destinationPage.properties?.["Artifact Key"]), 200);
+  if (artifactKey) {
+    try {
+      const match = await notion(env, `/databases/${env.RECENT_DATABASE_ID}/query`, {
+        method: "POST",
+        body: JSON.stringify({ page_size: 2, filter: { property: "Artifact Key", rich_text: { equals: artifactKey } } }),
+      });
+      if (match.results?.[0]) return match.results[0];
+    } catch {
+      // Older schemas may not have Artifact Key until setup reconciliation runs.
+    }
+  }
+
+  for (const relation of (destinationPage.properties?.["Recent Item"]?.relation || []).slice(0, 5)) {
+    try {
+      const candidate = await notion(env, `/pages/${relation.id}`);
+      const targets = candidate.properties?.[config.relation]?.relation || [];
+      if (normalizeId(candidate.parent?.database_id) === normalizeId(env.RECENT_DATABASE_ID)
+          && targets.length === 1
+          && normalizeId(targets[0].id) === normalizeId(destinationPage.id)) return candidate;
+    } catch {
+      // Ignore stale or inaccessible relations and create a fresh control row.
+    }
+  }
+
+  return notion(env, "/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { database_id: env.RECENT_DATABASE_ID },
+      properties: {
+        Status: { select: { name: "Processed" } },
+        ...recentPropertiesFromDestination(destinationPage, config),
+      },
+    }),
+  });
+}
+
+async function linkAndMirrorRecentDestination(recentPage, destinationPage, config, env) {
+  const recentChanges = changedProperties(recentPage.properties || {}, recentPropertiesFromDestination(destinationPage, config));
+  if (Object.keys(recentChanges).length) {
+    await notion(env, `/pages/${recentPage.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ properties: recentChanges }),
+    });
+  }
+  const backlink = { "Recent Item": { relation: [{ id: recentPage.id }] } };
+  const destinationChanges = changedProperties(destinationPage.properties || {}, backlink);
+  if (Object.keys(destinationChanges).length) {
+    await notion(env, `/pages/${destinationPage.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ properties: destinationChanges }),
+    });
   }
 }
 
@@ -829,10 +909,10 @@ function safeErrorCode(error) {
 
 async function routingDiagnostics(env) {
   const databases = [
-    ["meetings", env.MEETINGS_DATABASE_ID, { Name: "title", Recorded: "date", Participants: "rich_text", Summary: "rich_text", Decisions: "rich_text", "Open Questions": "rich_text", "Follow-up": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text", "Recent Item": "relation" }],
+    ["meetings", env.MEETINGS_DATABASE_ID, { Name: "title", Status: "status", Recorded: "date", Participants: "rich_text", Summary: "rich_text", Decisions: "rich_text", "Open Questions": "rich_text", "Follow-up": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text", "Recent Item": "relation" }],
     ["tasks", env.TASKS_DATABASE_ID, { Name: "title", Status: "status", Due: "date", Priority: "select", Owner: "rich_text", Summary: "rich_text", "Source Quote": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text", "Recent Item": "relation" }],
-    ["ideas", env.IDEAS_DATABASE_ID, { Name: "title", Recorded: "date", Topic: "select", Summary: "rich_text", "Why It Matters": "rich_text", "Next Experiment": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text", "Recent Item": "relation" }],
-    ["recent", env.RECENT_DATABASE_ID, { Name: "title", Status: "select", Type: "select", Area: "select", Recorded: "date", "AI Confidence": "number", Summary: "rich_text", Meeting: "relation", Tasks: "relation", Ideas: "relation", "Task Status": "status", Priority: "select", Due: "date", Owner: "rich_text", Database: "url", Destination: "url", Source: "url" }],
+    ["ideas", env.IDEAS_DATABASE_ID, { Name: "title", Status: "status", Recorded: "date", Topic: "select", Summary: "rich_text", "Why It Matters": "rich_text", "Next Experiment": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text", "Recent Item": "relation" }],
+    ["recent", env.RECENT_DATABASE_ID, { Name: "title", Status: "select", Type: "select", Area: "select", Recorded: "date", "AI Confidence": "number", Summary: "rich_text", Meeting: "relation", Tasks: "relation", Ideas: "relation", "Item Status": "status", "Task Status": "status", Priority: "select", Due: "date", Owner: "rich_text", Project: "relation", Client: "relation", People: "relation", "Artifact Key": "rich_text", Database: "url", Destination: "url", Source: "url" }],
     ["processing", env.PROCESSING_DATABASE_ID, { Name: "title", "Recording ID": "rich_text", Status: "select", Completed: "date", Mode: "select", Items: "number", Error: "rich_text", Source: "url", Destinations: "rich_text" }],
   ];
   const issues = [];
@@ -906,25 +986,26 @@ async function findOrCreateNamed(databaseId, name, extraProperties, env) {
   });
 }
 
-async function handlePropertiesUpdated(pageId, env) {
+async function handlePropertiesUpdated(pageId, env, updatedPropertyIds = []) {
   try {
     const page = await notion(env, `/pages/${pageId}`);
     if (normalizeId(page.parent?.database_id) === normalizeId(env.RECENT_DATABASE_ID)) {
-      await syncRecentItem(page, env);
+      await syncRecentItem(page, env, updatedPropertyIds);
       return;
     }
+    if (artifactConfigForPage(page, env)) await syncDestinationItem(page, env);
     if (env.FEEDBACK_DATABASE_ID) await captureRoutingFeedback(pageId, env);
   } catch {
     // Webhook retries or a later edit can recover; never expose Notion details.
   }
 }
 
-async function syncRecentItem(recentPage, env) {
+async function syncRecentItem(recentPage, env, updatedPropertyIds = []) {
   const type = recentPage.properties?.Type?.select?.name || "";
   const config = {
-    Meeting: { relation: "Meeting", databaseId: env.MEETINGS_DATABASE_ID },
-    Task: { relation: "Tasks", databaseId: env.TASKS_DATABASE_ID },
-    Idea: { relation: "Ideas", databaseId: env.IDEAS_DATABASE_ID },
+    Meeting: { kind: "meeting", type: "Meeting", relation: "Meeting", databaseId: env.MEETINGS_DATABASE_ID },
+    Task: { kind: "task", type: "Task", relation: "Tasks", databaseId: env.TASKS_DATABASE_ID },
+    Idea: { kind: "idea", type: "Idea", relation: "Ideas", databaseId: env.IDEAS_DATABASE_ID },
   }[type];
   if (!config?.databaseId) return;
 
@@ -946,10 +1027,19 @@ async function syncRecentItem(recentPage, env) {
   }
   properties.Summary = editableRichTextProperty(propertyText(source.Summary), 1900);
 
-  if (type === "Task") {
-    const status = cleanAiText(source["Task Status"]?.status?.name, 100);
-    if (status) properties.Status = { status: { name: status } };
+  const itemStatusUpdated = propertyWasUpdated(recentPage, "Item Status", updatedPropertyIds);
+  const taskStatusUpdated = propertyWasUpdated(recentPage, "Task Status", updatedPropertyIds);
+  const statusProperty = type === "Task" && taskStatusUpdated && !itemStatusUpdated
+    ? source["Task Status"]
+    : source["Item Status"] || source["Task Status"];
+  const status = cleanAiText(statusProperty?.status?.name, 100);
+  if (status) properties.Status = { status: { name: status } };
 
+  properties.Project = relationValue(source.Project);
+  properties.Client = relationValue(source.Client);
+  if (type === "Meeting") properties.People = relationValue(source.People);
+
+  if (type === "Task") {
     const priority = source.Priority?.select?.name || "";
     properties.Priority = ["Low", "Medium", "High", "Urgent"].includes(priority)
       ? { select: { name: priority } }
@@ -960,10 +1050,106 @@ async function syncRecentItem(recentPage, env) {
     properties.Owner = editableRichTextProperty(propertyText(source.Owner), 120);
   }
 
-  await notion(env, `/pages/${destination.id}`, {
+  const changed = changedProperties(destination.properties || {}, properties);
+  let currentDestination = destination;
+  if (Object.keys(changed).length) {
+    currentDestination = await notion(env, `/pages/${destination.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ properties: changed }),
+    });
+  }
+  await syncDestinationIntoRecent(currentDestination, recentPage, config, env);
+}
+
+async function syncDestinationItem(destinationPage, env) {
+  const config = artifactConfigForPage(destinationPage, env);
+  if (!config) return;
+  const relations = destinationPage.properties?.["Recent Item"]?.relation || [];
+  if (relations.length !== 1) return;
+  const recentPage = await notion(env, `/pages/${relations[0].id}`);
+  if (normalizeId(recentPage.parent?.database_id) !== normalizeId(env.RECENT_DATABASE_ID)) return;
+  const typedRelations = recentPage.properties?.[config.relation]?.relation || [];
+  if (typedRelations.length !== 1 || normalizeId(typedRelations[0].id) !== normalizeId(destinationPage.id)) return;
+  await syncDestinationIntoRecent(destinationPage, recentPage, config, env);
+}
+
+async function syncDestinationIntoRecent(destinationPage, recentPage, config, env) {
+  const desired = recentPropertiesFromDestination(destinationPage, config);
+  const changed = changedProperties(recentPage.properties || {}, desired);
+  if (!Object.keys(changed).length) return;
+  await notion(env, `/pages/${recentPage.id}`, {
     method: "PATCH",
-    body: JSON.stringify({ properties }),
+    body: JSON.stringify({ properties: changed }),
   });
+}
+
+function artifactConfigForPage(page, env) {
+  const databaseId = normalizeId(page.parent?.database_id);
+  return [
+    { kind: "meeting", type: "Meeting", relation: "Meeting", databaseId: env.MEETINGS_DATABASE_ID },
+    { kind: "task", type: "Task", relation: "Tasks", databaseId: env.TASKS_DATABASE_ID },
+    { kind: "idea", type: "Idea", relation: "Ideas", databaseId: env.IDEAS_DATABASE_ID },
+  ].find((config) => config.databaseId && databaseId === normalizeId(config.databaseId)) || null;
+}
+
+function recentPropertiesFromDestination(destinationPage, config) {
+  const source = destinationPage.properties || {};
+  const status = cleanAiText(source.Status?.status?.name, 100);
+  const area = source.Area?.select?.name || "";
+  const confidence = source["AI Confidence"]?.number;
+  const recorded = source.Recorded?.date?.start || destinationPage.created_time || "";
+  const properties = {
+    Name: titleProperty(propertyText(source.Name) || "Untitled item"),
+    Type: { select: { name: config.type } },
+    Summary: editableRichTextProperty(propertyText(source.Summary), 1900),
+    Meeting: { relation: config.kind === "meeting" ? [{ id: destinationPage.id }] : [] },
+    Tasks: { relation: config.kind === "task" ? [{ id: destinationPage.id }] : [] },
+    Ideas: { relation: config.kind === "idea" ? [{ id: destinationPage.id }] : [] },
+    Project: relationValue(source.Project),
+    Client: relationValue(source.Client),
+    People: config.kind === "meeting" ? relationValue(source.People) : { relation: [] },
+    "Artifact Key": editableRichTextProperty(propertyText(source["Artifact Key"]), 200),
+    Database: { url: `https://app.notion.com/p/${normalizeId(config.databaseId)}` },
+    Destination: { url: destinationPage.url || `https://www.notion.so/${normalizeId(destinationPage.id)}` },
+    Source: { url: source.Source?.url || null },
+  };
+  if (status) {
+    properties["Item Status"] = { status: { name: status } };
+    properties["Task Status"] = config.kind === "task" ? { status: { name: status } } : { status: null };
+  }
+  if (["Work", "Personal Life", "Personal Work", "Needs Review"].includes(area)) {
+    properties.Area = { select: { name: area } };
+  }
+  if (Number.isFinite(confidence)) properties["AI Confidence"] = { number: confidence };
+  if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(recorded)) properties.Recorded = { date: { start: recorded } };
+
+  if (config.kind === "task") {
+    const priority = source.Priority?.select?.name || "";
+    properties.Priority = ["Low", "Medium", "High", "Urgent"].includes(priority)
+      ? { select: { name: priority } }
+      : { select: null };
+    const due = source.Due?.date?.start || "";
+    properties.Due = /^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(due) ? { date: { start: due } } : { date: null };
+    properties.Owner = editableRichTextProperty(propertyText(source.Owner), 120);
+  } else {
+    properties.Priority = { select: null };
+    properties.Due = { date: null };
+    properties.Owner = { rich_text: [] };
+  }
+  return properties;
+}
+
+function relationValue(property) {
+  return { relation: (property?.relation || []).slice(0, 100).map((item) => ({ id: item.id })) };
+}
+
+function propertyWasUpdated(page, name, updatedPropertyIds) {
+  const propertyId = normalizePropertyId(page.properties?.[name]?.id || "");
+  return propertyId && updatedPropertyIds.some((id) => normalizePropertyId(id) === propertyId);
+}
+
+function normalizePropertyId(value) {
+  try { return decodeURIComponent(String(value)); } catch { return String(value); }
 }
 
 export async function backfillRecentRelations(env) {
@@ -975,36 +1161,54 @@ export async function backfillRecentRelations(env) {
   ].filter((config) => config.databaseId);
 
   const recentPages = await listDatabasePages(env.RECENT_DATABASE_ID, env);
+  const recentByArtifactKey = new Map();
   const recentBySource = new Map();
   for (const page of recentPages) {
+    const artifactKey = propertyText(page.properties?.["Artifact Key"]);
+    if (artifactKey && !recentByArtifactKey.has(artifactKey)) recentByArtifactKey.set(artifactKey, page);
     const source = page.properties?.Source?.url || "";
-    if (source && !recentBySource.has(source)) recentBySource.set(source, page);
+    if (source) recentBySource.set(source, [...(recentBySource.get(source) || []), page]);
   }
 
-  const grouped = new Map();
+  const items = [];
   for (const config of configs) {
     for (const page of await listDatabasePages(config.databaseId, env)) {
       if (page.archived) continue;
       const source = page.properties?.Source?.url || "";
       if (!source) continue;
-      const items = grouped.get(source) || [];
-      items.push({ ...config, page });
-      grouped.set(source, items);
+      items.push({ ...config, page, source });
     }
   }
 
   let reconciledRecent = 0;
   let reconciledDestinations = 0;
   let errors = 0;
-  for (const [source, items] of grouped) {
+  const usedRecentIds = new Set();
+  for (const item of items) {
     try {
-      let recentPage = recentBySource.get(source) || null;
-      const requestedId = notionPageIdFromURL(recentPage?.properties?.Destination?.url);
-      const requestedType = recentPage?.properties?.Type?.select?.name || "";
-      const primary = items.find((item) => normalizeId(item.page.id) === normalizeId(requestedId))
-        || items.find((item) => item.type === requestedType)
-        || items[0];
-      if (!primary) continue;
+      const artifactKey = propertyText(item.page.properties?.["Artifact Key"]);
+      let recentPage = artifactKey ? recentByArtifactKey.get(artifactKey) : null;
+      if (recentPage && usedRecentIds.has(normalizeId(recentPage.id))) recentPage = null;
+
+      if (!recentPage) {
+        const backlinkIds = (item.page.properties?.["Recent Item"]?.relation || []).map((relation) => normalizeId(relation.id));
+        recentPage = recentPages.find((candidate) => {
+          if (usedRecentIds.has(normalizeId(candidate.id)) || !backlinkIds.includes(normalizeId(candidate.id))) return false;
+          const targets = candidate.properties?.[item.relation]?.relation || [];
+          return targets.length === 1 && normalizeId(targets[0].id) === normalizeId(item.page.id);
+        }) || null;
+      }
+
+      if (!recentPage) {
+        const candidates = (recentBySource.get(item.source) || []).filter((candidate) => !usedRecentIds.has(normalizeId(candidate.id)));
+        recentPage = candidates.find((candidate) => normalizeId(notionPageIdFromURL(candidate.properties?.Destination?.url)) === normalizeId(item.page.id))
+          || candidates.find((candidate) => {
+            const targets = candidate.properties?.[item.relation]?.relation || [];
+            return candidate.properties?.Type?.select?.name === item.type
+              && targets.some((target) => normalizeId(target.id) === normalizeId(item.page.id));
+          })
+          || null;
+      }
 
       if (!recentPage) {
         recentPage = await notion(env, "/pages", {
@@ -1012,28 +1216,20 @@ export async function backfillRecentRelations(env) {
           body: JSON.stringify({
             parent: { database_id: env.RECENT_DATABASE_ID },
             properties: {
-              Name: titleProperty(propertyText(primary.page.properties?.Name) || "Recovered AnkerCore item"),
               Status: { select: { name: "Processed" } },
-              Source: { url: source },
+              ...recentPropertiesFromDestination(item.page, item),
             },
           }),
         });
-        recentBySource.set(source, recentPage);
+        recentPages.push(recentPage);
+        recentBySource.set(item.source, [...(recentBySource.get(item.source) || []), recentPage]);
+        if (artifactKey) recentByArtifactKey.set(artifactKey, recentPage);
       }
 
-      await notion(env, `/pages/${recentPage.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ properties: recentMirrorProperties(primary, items, source) }),
-      });
+      usedRecentIds.add(normalizeId(recentPage.id));
+      await linkAndMirrorRecentDestination(recentPage, item.page, item, env);
       reconciledRecent += 1;
-
-      for (const item of items) {
-        await notion(env, `/pages/${item.page.id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ properties: { "Recent Item": { relation: [{ id: recentPage.id }] } } }),
-        });
-        reconciledDestinations += 1;
-      }
+      reconciledDestinations += 1;
     } catch {
       // A removed row or malformed legacy property must not block other sources.
       errors += 1;
@@ -1056,49 +1252,6 @@ async function listDatabasePages(databaseId, env, maximum = 500) {
     cursor = pages.length < maximum && data.has_more ? data.next_cursor : null;
   } while (cursor);
   return pages;
-}
-
-function recentMirrorProperties(primary, items, source) {
-  const sourceProperties = primary.page.properties || {};
-  const properties = {
-    Name: titleProperty(propertyText(sourceProperties.Name) || "Recovered AnkerCore item"),
-    Type: { select: { name: primary.type } },
-    Summary: editableRichTextProperty(propertyText(sourceProperties.Summary), 1900),
-    Database: { url: `https://app.notion.com/p/${normalizeId(primary.databaseId)}` },
-    Destination: { url: primary.page.url || `https://www.notion.so/${normalizeId(primary.page.id)}` },
-    Source: { url: source },
-  };
-  for (const config of [
-    { kind: "meeting", relation: "Meeting" },
-    { kind: "task", relation: "Tasks" },
-    { kind: "idea", relation: "Ideas" },
-  ]) {
-    properties[config.relation] = {
-      relation: items.filter((item) => item.kind === config.kind).slice(0, 100).map((item) => ({ id: item.page.id })),
-    };
-  }
-
-  const area = sourceProperties.Area?.select?.name || "";
-  if (["Work", "Personal Life", "Personal Work", "Needs Review"].includes(area)) {
-    properties.Area = { select: { name: area } };
-  }
-  const confidence = sourceProperties["AI Confidence"]?.number;
-  if (Number.isFinite(confidence)) properties["AI Confidence"] = { number: confidence };
-  const recorded = sourceProperties.Recorded?.date?.start || primary.page.created_time || "";
-  if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(recorded)) properties.Recorded = { date: { start: recorded } };
-
-  if (primary.kind === "task") {
-    const status = cleanAiText(sourceProperties.Status?.status?.name, 100);
-    if (status) properties["Task Status"] = { status: { name: status } };
-    const priority = sourceProperties.Priority?.select?.name || "";
-    properties.Priority = ["Low", "Medium", "High", "Urgent"].includes(priority)
-      ? { select: { name: priority } }
-      : { select: null };
-    const due = sourceProperties.Due?.date?.start || "";
-    properties.Due = /^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(due) ? { date: { start: due } } : { date: null };
-    properties.Owner = editableRichTextProperty(propertyText(sourceProperties.Owner), 120);
-  }
-  return properties;
 }
 
 function notionPageIdFromURL(value) {
@@ -1713,6 +1866,30 @@ function richTextProperty(value) { return { rich_text: richText(value) }; }
 function editableRichTextProperty(value, maxLength) {
   const clean = cleanAiText(value, maxLength);
   return { rich_text: clean ? richText(clean) : [] };
+}
+function changedProperties(current, desired) {
+  return Object.fromEntries(Object.entries(desired).filter(([name, update]) => !propertyUpdateMatches(current[name], update)));
+}
+function propertyUpdateMatches(current, update) {
+  if (!current || !update || typeof update !== "object") return false;
+  if (Object.hasOwn(update, "title")) return propertyText(current) === updateText(update.title);
+  if (Object.hasOwn(update, "rich_text")) return propertyText(current) === updateText(update.rich_text);
+  if (Object.hasOwn(update, "select")) return (current.select?.name || "") === (update.select?.name || "");
+  if (Object.hasOwn(update, "status")) return (current.status?.name || "") === (update.status?.name || "");
+  if (Object.hasOwn(update, "url")) return (current.url || "") === (update.url || "");
+  if (Object.hasOwn(update, "number")) return current.number === update.number;
+  if (Object.hasOwn(update, "date")) {
+    return (current.date?.start || "") === (update.date?.start || "")
+      && (current.date?.end || "") === (update.date?.end || "");
+  }
+  if (Object.hasOwn(update, "relation")) {
+    const ids = (value) => (value || []).map((item) => normalizeId(item.id)).sort().join(",");
+    return ids(current.relation) === ids(update.relation);
+  }
+  return false;
+}
+function updateText(items) {
+  return (items || []).map((item) => item?.plain_text ?? item?.text?.content ?? "").join("");
 }
 function richText(value) { return [{ type: "text", text: { content: String(value).slice(0, 2000) } }]; }
 function normalizeId(value = "") { return String(value).replace(/-/g, "").toLowerCase(); }
