@@ -250,6 +250,70 @@ test("supplied on-device analysis cannot invent a meeting or people", async () =
   }
 });
 
+test("editing one linked task in Recent Items updates only its destination", async () => {
+  const originalFetch = globalThis.fetch;
+  const verificationToken = "notion-webhook-test-token";
+  const recentPageId = "99999999-9999-9999-9999-999999999999";
+  const taskPageId = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb";
+  const patches = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith(`/pages/${recentPageId}`) && !init.method) {
+      return response({
+        id: recentPageId,
+        parent: { database_id: ids.recent },
+        properties: {
+          Name: { title: [{ plain_text: "Send the revised launch plan" }] },
+          Type: { select: { name: "Task" } },
+          Area: { select: { name: "Work" } },
+          Summary: { rich_text: [{ plain_text: "Send the revised plan to the team." }] },
+          Tasks: { relation: [{ id: taskPageId }] },
+          "Task Status": { status: { name: "In progress" } },
+          Priority: { select: { name: "High" } },
+          Due: { date: { start: "2026-09-02" } },
+          Owner: { rich_text: [{ plain_text: "Hayden" }] },
+        },
+      });
+    }
+    if (url.pathname.endsWith(`/pages/${taskPageId}`) && !init.method) {
+      return response({ id: taskPageId, parent: { database_id: ids.tasks }, properties: {} });
+    }
+    if (url.pathname.endsWith(`/pages/${taskPageId}`) && init.method === "PATCH") {
+      patches.push(JSON.parse(init.body));
+      return response({ id: taskPageId });
+    }
+    throw new Error(`Unexpected Notion request: ${init.method || "GET"} ${url.pathname}`);
+  };
+
+  try {
+    const body = JSON.stringify({ type: "page.properties_updated", entity: { id: recentPageId } });
+    const signature = await notionSignature(body, verificationToken);
+    let background;
+    const result = await worker.fetch(new Request("https://example.test/notion", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-notion-signature": signature },
+      body,
+    }), { ...environment(), NOTION_VERIFICATION_TOKEN: verificationToken }, {
+      waitUntil(promise) { background = promise; },
+    });
+    assert.equal(result.status, 202);
+    await background;
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].properties.Name.title[0].text.content, "Send the revised launch plan");
+    assert.equal(patches[0].properties.Status.status.name, "In progress");
+    assert.equal(patches[0].properties.Priority.select.name, "High");
+    assert.equal(patches[0].properties.Due.date.start, "2026-09-02");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+async function notionSignature(body, secret) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const bytes = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
+  return `sha256=${[...bytes].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
 function response(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }

@@ -34,6 +34,8 @@ Cloudflare includes a daily Workers AI allocation. Review [current Workers AI pr
 ```text
 AnkerCore/                 iOS application source
 AnkerCore.xcodeproj/       Xcode project
+AnkerCoreWidget/           Home-screen status and task widget
+Shared/                    App/widget snapshot models
 worker/index.js            Cloudflare Worker and Notion router
 worker/wrangler.jsonc      Worker configuration template
 ```
@@ -127,8 +129,9 @@ curl https://YOUR-WORKER.workers.dev/health
 2. Select the **AnkerCore** target, then **Signing & Capabilities**.
 3. Choose your development team.
 4. The public target uses `com.ankercore.app`. Change it to a bundle identifier your team owns if you are creating a separate App Store record.
-5. Connect your iPhone, select it as the run destination, and press **Run**.
-6. Approve Bluetooth and Speech Recognition access when prompted.
+5. Register an App Group for the app and widget. The included targets use `group.com.ankercore.app`; forks should change that value in both entitlements files and `Shared/WidgetData.swift`.
+6. Connect your iPhone, select it as the run destination, and press **Run**.
+7. Approve Bluetooth and Speech Recognition access when prompted.
 
 In AnkerCore, open **Settings** and enter:
 
@@ -206,6 +209,20 @@ The first enrollment downloads FluidAudio's diarization models. Mathematical voi
 The authenticated `GET /tasks` endpoint powers the app's running open-task list. `POST /tasks/{page-id}/complete` verifies that the page belongs to the configured Tasks database before marking it done. The Processing Log records stages, mode, item count, destinations, and sanitized errors without copying transcript or audio content.
 
 The iPhone app also keeps a separate per-recording processing timeline. The Relay screen shows the six most recent recordings with live states for secure fetch, on-device or fallback transcription, AI sorting, Notion routing, and optional webhook delivery. Tap a timeline to see timestamps and direct links to every returned Notion item and database. If anything fails, **Re-process recording** starts another attempt from the saved local audio, or fetches it from the connected recorder when necessary. Explicit retries resume routing with artifact-key deduplication, so completed Notion items are reused while missing items and webhook delivery are attempted again. Saved playable recordings are rediscovered after an app restart. Up to 100 timelines with 50 events each are stored locally with file protection and excluded from backup; Settings can clear this history without deleting audio or Notion records. Timeline entries never contain audio data, transcript text, credentials, webhook URLs, or cryptographic material.
+
+The **AnkerCore Relay** home-screen widget mirrors up to 20 recent recording states and 20 open tasks from the app's protected App Group snapshot. Medium and large widgets show both lists; the small widget shows the newest recording and open-task count. Notion links are tappable. To add it, long-press the iPhone Home Screen, choose **Edit → Add Widget**, search for **AnkerCore**, and select a size. Open AnkerCore after installing an update so it can populate the first snapshot. The widget contains no audio, transcript text, tokens, webhook configuration, or voice embeddings.
+
+## Recent Items as the control surface
+
+Each Recent Items row is linked to all Meetings, Tasks, and Ideas extracted from that recording. The destination rows also link back through **Recent Item**. The row's **Type** selects the editable control target:
+
+- **Meeting** + exactly one **Meeting** relation
+- **Task** + exactly one **Tasks** relation
+- **Idea** + exactly one **Ideas** relation
+
+Edits to **Name**, **Area**, and **Summary** in Recent Items are copied to that selected destination by the signed Notion webhook. A Task also synchronizes **Task Status**, **Priority**, **Due**, and **Owner**. Processing **Status** remains operational metadata and is never copied. When a recording produces multiple tasks or ideas, set the matching relation to exactly one row before editing; AnkerCore intentionally refuses ambiguous multi-row updates. Changing **Type** selects another already-linked artifact—it does not move or recreate records between databases.
+
+This is a guarded one-way edit path from Recent Items to the destination databases. Editing destination-only fields such as meeting decisions, task source quotes, or idea experiments still happens in their native database. After upgrading an existing installation through `/setup`, AnkerCore backfills links for older Recent rows when their saved destination URL is still valid.
 
 Settings includes **Test connection**, which authenticates to the Worker and performs a read-only validation of the configured Notion routing schemas. The check runs automatically after saving a connection and at launch; it never uploads audio or transcript text. Routing failures distinguish invalid credentials, network/DNS/TLS failures, Notion access loss, missing targets, rate limits, and schema mismatches without exposing response bodies or secrets.
 

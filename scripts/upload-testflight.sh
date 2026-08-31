@@ -56,7 +56,7 @@ xcodebuild \
   -archivePath "$archive_path" \
   -allowProvisioningUpdates \
   DEVELOPMENT_TEAM="$team_id" \
-  PRODUCT_BUNDLE_IDENTIFIER="$bundle_id" \
+  ANKERCORE_APP_BUNDLE_IDENTIFIER="$bundle_id" \
   MARKETING_VERSION="$version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   clean archive

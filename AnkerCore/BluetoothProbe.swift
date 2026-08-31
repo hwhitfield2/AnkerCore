@@ -111,6 +111,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         record(kind: "capture", summary: "Started a new local diagnostic capture")
         restoreDownloadedRecordings()
         reloadVoiceProfiles()
+        syncWidgetSnapshot()
         if uploadConfigured { testUploadConnection() }
     }
 
@@ -245,6 +246,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
             uploadState = "Automatic processing is off"
             openTasks = []
             tasksState = "Connect your private route to load tasks"
+            syncWidgetSnapshot()
         } catch {
             uploadState = error.localizedDescription
         }
@@ -261,6 +263,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
                     openTasks = tasks
                     tasksState = tasks.isEmpty ? "You’re all caught up" : "\(tasks.count) open"
                     tasksLoading = false
+                    syncWidgetSnapshot()
                 }
             } catch {
                 await MainActor.run {
@@ -309,6 +312,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
                     openTasks.removeAll { $0.id == task.id }
                     tasksState = openTasks.isEmpty ? "You’re all caught up" : "\(openTasks.count) open"
                     tasksLoading = false
+                    syncWidgetSnapshot()
                 }
             } catch {
                 await MainActor.run {
@@ -426,6 +430,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     func clearProcessingHistory() {
         processingLogs = [:]
         ProcessingLogPersistence.clear()
+        syncWidgetSnapshot()
     }
 
     func startNewCapture() {
@@ -1123,6 +1128,56 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
         processingLogs = updated
         ProcessingLogPersistence.save(updated)
+        syncWidgetSnapshot()
+    }
+
+    private func syncWidgetSnapshot() {
+        var recordingDates = Dictionary(uniqueKeysWithValues: recordings.map { ($0.id, $0.recordedAt) })
+        for log in processingLogs.values { recordingDates[log.id] = log.recordedAt }
+
+        let recordingSnapshots = recordingDates.map { id, recordedAt in
+            let log = processingLogs[id]
+            let event = log?.latestEvent
+            let destination = log?.events.reversed().lazy
+                .flatMap(\.links)
+                .first(where: { $0.url.scheme == "https" })?.url
+            return AnkerCoreWidgetRecording(
+                id: id,
+                recordedAt: recordedAt,
+                stage: event.map { Self.widgetStageName($0.stage) } ?? "Captured",
+                state: event?.state.rawValue ?? RecordingProcessingState.waiting.rawValue,
+                title: String((event?.title ?? "Not processed yet").prefix(100)),
+                destination: destination
+            )
+        }
+        .sorted { $0.recordedAt > $1.recordedAt }
+
+        let taskSnapshots = openTasks.prefix(20).map { task in
+            AnkerCoreWidgetTask(
+                id: task.id,
+                title: String(task.title.prefix(120)),
+                due: task.dueDate,
+                priority: task.priority,
+                area: task.area,
+                url: task.url
+            )
+        }
+        AnkerCoreWidgetStore.save(AnkerCoreWidgetSnapshot(
+            updatedAt: Date(),
+            recordings: Array(recordingSnapshots.prefix(20)),
+            tasks: taskSnapshots
+        ))
+    }
+
+    private static func widgetStageName(_ stage: RecordingProcessingStage) -> String {
+        switch stage {
+        case .capture: "Captured"
+        case .fetch: "Audio fetch"
+        case .transcription: "Transcription"
+        case .classification: "AI sorting"
+        case .routing: "Notion routing"
+        case .delivery: "Delivery"
+        }
     }
 
     private func restoreDownloadedRecordings() {
@@ -1530,6 +1585,7 @@ extension BluetoothProbe: CBPeripheralDelegate {
             recordingListState = loadedRecordings.isEmpty
                 ? "No recordings found"
                 : "Loaded \(loadedRecordings.count) recording(s)"
+            syncWidgetSnapshot()
         }
         if let decoded {
             if let state = decoded.state { recorderState = state }
