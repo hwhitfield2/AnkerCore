@@ -107,6 +107,11 @@ async function receiveAudio(request, env) {
 
   const fileId = (request.headers.get("x-ankercore-file-id") || request.headers.get("x-soundcore-file-id") || "").trim();
   if (!/^\d{9,12}$/.test(fileId)) return json({ ok: false, error: "invalid_file_id" }, 400);
+  const reprocessHeader = (request.headers.get("x-ankercore-reprocess") || "").trim().toLowerCase();
+  if (reprocessHeader && reprocessHeader !== "true" && reprocessHeader !== "false") {
+    return json({ ok: false, error: "invalid_reprocess" }, 400);
+  }
+  const reprocess = reprocessHeader === "true";
 
   const recordedHeader = (request.headers.get("x-ankercore-recorded-at") || request.headers.get("x-soundcore-recorded-at") || "").trim();
   const parsedRecorded = recordedHeader ? Date.parse(recordedHeader) : Number(fileId) * 1000;
@@ -157,7 +162,7 @@ async function receiveAudio(request, env) {
     });
   }
 
-  const routed = await routePage(inboxPage.id, env);
+  const routed = await routePage(inboxPage.id, env, null, { reprocess });
   const webhook = await deliverWebhook(webhookURL, transcript, recorded, fileId, routed);
   return json({
     ok: true,
@@ -195,6 +200,10 @@ async function receiveTranscript(request, env) {
 
   const fileId = String(body.file_id || "").trim();
   if (!/^\d{9,12}$/.test(fileId)) return json({ ok: false, error: "invalid_file_id" }, 400);
+  if (body.reprocess != null && typeof body.reprocess !== "boolean") {
+    return json({ ok: false, error: "invalid_reprocess" }, 400);
+  }
+  const reprocess = body.reprocess === true;
   const parsedRecorded = body.recorded_at ? Date.parse(String(body.recorded_at)) : Number(fileId) * 1000;
   if (!Number.isFinite(parsedRecorded)) return json({ ok: false, error: "invalid_recorded_at" }, 400);
   const transcript = cleanAiText(body.transcript, clampInteger(env.AI_MAX_CHARS, 4000, 50000, 30000));
@@ -222,7 +231,7 @@ async function receiveTranscript(request, env) {
     });
   }
 
-  const routed = await routePage(inboxPage.id, env, suppliedAnalysis);
+  const routed = await routePage(inboxPage.id, env, suppliedAnalysis, { reprocess });
   const webhook = await deliverWebhook(webhookURL, transcript, recorded, fileId, routed);
   return json({
     ok: true,
@@ -525,7 +534,7 @@ function safeEqual(a, b) {
   return mismatch === 0;
 }
 
-async function routePage(pageId, env, suppliedAnalysis = null) {
+async function routePage(pageId, env, suppliedAnalysis = null, options = {}) {
   if (!env.NOTION_TOKEN) return { ignored: true, reason: "not_configured" };
   const page = await notion(env, `/pages/${pageId}`);
   if (!page || page.archived || normalizeId(page.parent?.page_id) !== normalizeId(env.INBOX_PAGE_ID)) return { ignored: true, reason: "outside_inbox" };
@@ -534,7 +543,9 @@ async function routePage(pageId, env, suppliedAnalysis = null) {
   if (!transcript) return { ignored: true, reason: "no_transcript" };
 
   const source = page.url || `https://www.notion.so/${normalizeId(pageId)}`;
-  if (await alreadyRoutedAnywhere(source, env)) return { ignored: true, reason: "already_routed", source };
+  if (!options.reprocess && await alreadyRoutedAnywhere(source, env)) {
+    return { ignored: true, reason: "already_routed", source };
+  }
 
   const recorded = recordedAt(page, env.TIMEZONE_OFFSET || "-07:00");
   const initialKind = explicitType(transcript) || classify(transcript);

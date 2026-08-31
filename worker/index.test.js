@@ -87,6 +87,89 @@ test("task endpoints require authentication", async () => {
   assert.equal(result.status, 401);
 });
 
+test("explicit reprocessing bypasses source dedupe and reuses routed artifacts", async () => {
+  const originalFetch = globalThis.fetch;
+  const created = [];
+  let sourceDedupeQueries = 0;
+  let nextPage = 100;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (url.pathname.endsWith(`/blocks/${ids.inbox}/children`)) return response({ results: [] });
+    if (url.pathname.endsWith("/pages") && init.method === "POST") {
+      const isSource = body?.parent?.page_id === ids.inbox;
+      const page = {
+        id: isSource ? "77777777-7777-7777-7777-777777777777" : `bbbbbbbb-bbbb-bbbb-bbbb-${String(nextPage++).padStart(12, "0")}`,
+        url: isSource ? "https://www.notion.so/retry-source" : `https://www.notion.so/retry-${nextPage}`,
+      };
+      created.push({ body, page });
+      return response(page);
+    }
+    if (url.pathname.includes("/pages/") && !init.method) {
+      return response({
+        id: "77777777-7777-7777-7777-777777777777",
+        parent: { page_id: ids.inbox },
+        properties: { Name: { type: "title", title: [{ plain_text: "2026-08-31 10:00:00 · AnkerCore 1788200001" }] } },
+        created_time: "2026-08-31T17:00:00Z",
+        url: "https://www.notion.so/retry-source",
+      });
+    }
+    if (url.pathname.includes("/blocks/") && url.pathname.endsWith("/children")) {
+      return response({ results: [{ type: "paragraph", paragraph: { rich_text: [{ plain_text: "Hayden: I will prepare the dashboard. Carter: I will review the risks." }] } }] });
+    }
+    if (url.pathname.includes("/databases/") && url.pathname.endsWith("/query")) {
+      const property = body?.filter?.property;
+      if (property === "Source") {
+        sourceDedupeQueries += 1;
+        return response({ results: [{ id: "already-routed" }] });
+      }
+      if (property === "Artifact Key") {
+        return response({ results: [{ id: `existing-${nextPage++}`, url: `https://www.notion.so/existing-${nextPage}` }] });
+      }
+      return response({ results: [] });
+    }
+    if (url.pathname.includes("/pages/") && init.method === "PATCH") return response({ id: "updated" });
+    throw new Error(`Unexpected Notion request: ${init.method || "GET"} ${url.pathname}`);
+  };
+
+  try {
+    const request = new Request("https://example.test/transcript", {
+      method: "POST",
+      headers: { authorization: `Bearer ${"x".repeat(32)}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        file_id: "1788200001",
+        recorded_at: "2026-08-31T17:00:00Z",
+        transcript: "Hayden: I will prepare the dashboard. Carter: I will review the risks.",
+        reprocess: true,
+      }),
+    });
+    const result = await worker.fetch(request, environment(), {});
+    const payload = await result.json();
+    assert.equal(result.status, 201);
+    assert.equal(payload.routed.item_count, 4);
+    assert.equal(sourceDedupeQueries, 0);
+    const routedCreates = created.filter((item) => [ids.meetings, ids.tasks, ids.ideas].includes(item.body?.parent?.database_id));
+    assert.equal(routedCreates.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reprocess accepts booleans only", async () => {
+  const request = new Request("https://example.test/transcript", {
+    method: "POST",
+    headers: { authorization: `Bearer ${"x".repeat(32)}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      file_id: "1788200002",
+      transcript: "A valid transcript body.",
+      reprocess: "true",
+    }),
+  });
+  const result = await worker.fetch(request, environment(), {});
+  assert.equal(result.status, 400);
+  assert.equal((await result.json()).error, "invalid_reprocess");
+});
+
 function response(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }

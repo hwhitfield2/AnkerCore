@@ -526,6 +526,7 @@ private struct ProcessingLogView: View {
     @ObservedObject var probe: BluetoothProbe
     let recording: RecordingMetadata
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmingReprocess = false
 
     private var log: RecordingProcessingLog? { probe.processingLog(for: recording.id) }
 
@@ -557,6 +558,34 @@ private struct ProcessingLogView: View {
                         .background(RelayPalette.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(RelayPalette.stroke, lineWidth: 1))
 
+                        VStack(alignment: .leading, spacing: 9) {
+                            Button {
+                                confirmingReprocess = true
+                            } label: {
+                                HStack(spacing: 10) {
+                                    if probe.isProcessing(recording) {
+                                        ProgressView().tint(.white)
+                                    } else {
+                                        Image(systemName: "arrow.clockwise.circle.fill")
+                                    }
+                                    Text(probe.isProcessing(recording) ? "Processing…" : "Re-process recording")
+                                    Spacer()
+                                }
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .frame(minHeight: 50)
+                                .background(RelayPalette.coral, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!probe.canReprocess(recording))
+                            .opacity(probe.canReprocess(recording) ? 1 : 0.55)
+
+                            Text(probe.reprocessAvailability(for: recording))
+                                .font(.caption)
+                                .foregroundStyle(RelayPalette.secondaryText)
+                        }
+
                         if let log, !log.events.isEmpty {
                             VStack(alignment: .leading, spacing: 0) {
                                 ForEach(Array(log.events.enumerated()), id: \.element.id) { index, event in
@@ -582,6 +611,12 @@ private struct ProcessingLogView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }.fontWeight(.semibold)
                 }
+            }
+            .alert("Re-process this recording?", isPresented: $confirmingReprocess) {
+                Button("Cancel", role: .cancel) {}
+                Button("Re-process") { probe.reprocessRecording(recording) }
+            } message: {
+                Text("AnkerCore will run transcription and routing again. Existing Notion items are reused, while incomplete work and webhook delivery are retried.")
             }
         }
         .preferredColorScheme(.dark)

@@ -67,6 +67,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var voiceProfiles: [VoiceProfile] = []
     @Published private(set) var voiceIdentityState = "No voice profiles enrolled"
     @Published private(set) var processingLogs = ProcessingLogPersistence.load()
+    @Published private(set) var processingRecordingIDs: Set<UInt32> = []
 
     var canScan: Bool { central?.state == .poweredOn }
     var canLoadRecordings: Bool { writeCharacteristic != nil }
@@ -88,6 +89,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     private let uploadClient = AnkerCoreUploadClient()
     private let onDeviceProcessor = OnDeviceProcessor()
     private var lastAutoRequestedID: UInt32?
+    private var pendingReprocessIDs: Set<UInt32> = []
     private var logHandle: FileHandle?
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -106,6 +108,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
             options: [CBCentralManagerOptionRestoreIdentifierKey: "AnkerCore.central"]
         )
         record(kind: "capture", summary: "Started a new local diagnostic capture")
+        restoreDownloadedRecordings()
         reloadVoiceProfiles()
     }
 
@@ -332,6 +335,62 @@ final class BluetoothProbe: NSObject, ObservableObject {
 
     func processingLog(for recordingID: UInt32) -> RecordingProcessingLog? {
         processingLogs[recordingID]
+    }
+
+    func isProcessing(_ recording: RecordingMetadata) -> Bool {
+        processingRecordingIDs.contains(recording.id) || pendingTransfer?.id == recording.id
+    }
+
+    func canReprocess(_ recording: RecordingMetadata) -> Bool {
+        guard uploadConfigured, !isProcessing(recording) else { return false }
+        return validatedDownloadedRecording(for: recording.id) != nil || canFetchRecording
+    }
+
+    func reprocessAvailability(for recording: RecordingMetadata) -> String {
+        if isProcessing(recording) { return "This recording is already processing." }
+        if !uploadConfigured { return "Connect the private Worker route in Settings before retrying." }
+        if validatedDownloadedRecording(for: recording.id) != nil { return "The saved audio will be processed again." }
+        if canFetchRecording { return "The audio will be fetched from Soundcore Work, then processed again." }
+        return "Reconnect Soundcore Work so AnkerCore can fetch the audio again."
+    }
+
+    func reprocessRecording(_ recording: RecordingMetadata) {
+        guard !isProcessing(recording) else { return }
+        guard uploadConfigured else {
+            uploadState = "Reconnect the private Worker route before retrying"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .routing,
+                state: .attention,
+                title: "Retry needs configuration",
+                detail: "Connect the private Worker route in Settings, then try again."
+            )
+            return
+        }
+
+        appendProcessingEvent(
+            recording: recording,
+            stage: .capture,
+            state: .running,
+            title: "Manual retry requested",
+            detail: "Starting a new processing attempt. Existing Notion artifacts will be reused."
+        )
+
+        if let fileURL = validatedDownloadedRecording(for: recording.id) {
+            uploadRecording(fileURL, recording: recording, reprocess: true)
+        } else if canFetchRecording {
+            pendingReprocessIDs.insert(recording.id)
+            fetchRecording(recording)
+        } else {
+            uploadState = "Reconnect Soundcore Work to retry this recording"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .fetch,
+                state: .attention,
+                title: "Retry waiting for recorder",
+                detail: "The local audio is unavailable. Reconnect Soundcore Work and retry to fetch it again."
+            )
+        }
     }
 
     func clearProcessingHistory() {
@@ -624,8 +683,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferNonce = nonce
         if size > 0 { transferExpectedBytes = Int(size) }
 
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AnkerCore Recordings", isDirectory: true)
+        let directory = Self.recordingsDirectory
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("\(target.id).opus.raw")
         try? FileManager.default.removeItem(at: url)
@@ -722,9 +780,11 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 title: "Recording fetched",
                 detail: "The playable audio file was saved securely on this iPhone."
             )
-            uploadRecording(finalURL, recording: target)
+            let reprocess = pendingReprocessIDs.remove(target.id) != nil
+            uploadRecording(finalURL, recording: target, reprocess: reprocess)
             record(kind: "secure-transfer", summary: "Saved playable file \(target.id) locally; audio omitted from capture")
         } else {
+            pendingReprocessIDs.remove(target.id)
             appendProcessingEvent(
                 recording: target,
                 stage: .fetch,
@@ -740,7 +800,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferNonce = nil
     }
 
-    private func uploadRecording(_ fileURL: URL, recording: RecordingMetadata) {
+    private func uploadRecording(_ fileURL: URL, recording: RecordingMetadata, reprocess: Bool = false) {
         guard uploadConfigured else {
             uploadState = "Saved locally — add the private token to process automatically"
             appendProcessingEvent(
@@ -752,6 +812,8 @@ final class BluetoothProbe: NSObject, ObservableObject {
             )
             return
         }
+        guard !processingRecordingIDs.contains(recording.id) else { return }
+        processingRecordingIDs.insert(recording.id)
         uploadState = "Transcribing on this iPhone…"
         processingMode = "On-device preferred"
         lastDestinationURL = nil
@@ -762,7 +824,9 @@ final class BluetoothProbe: NSObject, ObservableObject {
             title: "On-device transcription started",
             detail: "AnkerCore is attempting to transcribe the recording without uploading audio."
         )
-        Task {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.processingRecordingIDs.remove(recording.id) }
             let transcript: String
             do {
                 transcript = try await onDeviceProcessor.transcribe(fileURL: fileURL)
@@ -788,7 +852,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
                     )
                 }
                 do {
-                    let result = try await uploadClient.upload(fileURL: fileURL, recording: recording)
+                    let result = try await uploadClient.upload(fileURL: fileURL, recording: recording, reprocess: reprocess)
                     await applyUploadResult(result, mode: "Cloud transcription fallback", recording: recording)
                 } catch {
                     await MainActor.run {
@@ -806,13 +870,13 @@ final class BluetoothProbe: NSObject, ObservableObject {
             }
 
             if #available(iOS 26.0, *) {
-                await routeLocallyTranscribed(transcript, recording: recording)
+                await routeLocallyTranscribed(transcript, recording: recording, reprocess: reprocess)
             }
         }
     }
 
     @available(iOS 26.0, *)
-    private func routeLocallyTranscribed(_ transcript: String, recording: RecordingMetadata) async {
+    private func routeLocallyTranscribed(_ transcript: String, recording: RecordingMetadata, reprocess: Bool) async {
         var analysis: OnDeviceAnalysis?
         await MainActor.run {
             uploadState = "Sorting on this iPhone…"
@@ -859,7 +923,12 @@ final class BluetoothProbe: NSObject, ObservableObject {
                     detail: "Creating and linking the extracted records in the configured private databases."
                 )
             }
-            let result = try await uploadClient.routeTranscript(transcript, analysis: analysis, recording: recording)
+            let result = try await uploadClient.routeTranscript(
+                transcript,
+                analysis: analysis,
+                recording: recording,
+                reprocess: reprocess
+            )
             await applyUploadResult(
                 result,
                 mode: analysis == nil ? "Local transcript · cloud sorting" : "Fully on-device AI",
@@ -988,6 +1057,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferFileKey = nil
         transferNonce = nil
         if let failedRecording {
+            pendingReprocessIDs.remove(failedRecording.id)
             appendProcessingEvent(
                 recording: failedRecording,
                 stage: .fetch,
@@ -1023,6 +1093,44 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
         processingLogs = updated
         ProcessingLogPersistence.save(updated)
+    }
+
+    private func restoreDownloadedRecordings() {
+        let directory = Self.recordingsDirectory
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for url in urls where url.pathExtension.lowercased() == "ogg" {
+            guard let recordingID = UInt32(url.deletingPathExtension().lastPathComponent),
+                  Self.isValidStoredRecording(url)
+            else { continue }
+            downloadedRecordings[recordingID] = url
+        }
+    }
+
+    private func validatedDownloadedRecording(for recordingID: UInt32) -> URL? {
+        guard let url = downloadedRecordings[recordingID], Self.isValidStoredRecording(url) else { return nil }
+        return url
+    }
+
+    private static var recordingsDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AnkerCore Recordings", isDirectory: true)
+    }
+
+    private static func isValidStoredRecording(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "ogg",
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true,
+              let size = values.fileSize,
+              (100 ... 20 * 1024 * 1024).contains(size),
+              let handle = try? FileHandle(forReadingFrom: url)
+        else { return false }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: 4)) == Data([0x4F, 0x67, 0x67, 0x53])
     }
 
     private func processingLinks(from result: AnkerCoreUploadResult) -> [RecordingProcessingLink] {
@@ -1230,7 +1338,7 @@ extension BluetoothProbe: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        if transferHandle != nil { failTransfer("Bluetooth disconnected") }
+        if pendingTransfer != nil { failTransfer("Bluetooth disconnected") }
         connectedPeripheral = nil
         connectedPeripheralID = nil
         writeCharacteristic = nil

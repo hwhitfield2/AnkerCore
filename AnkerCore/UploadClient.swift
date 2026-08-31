@@ -152,7 +152,7 @@ struct AnkerCoreUploadClient {
         }
     }
 
-    func upload(fileURL: URL, recording: RecordingMetadata) async throws -> AnkerCoreUploadResult {
+    func upload(fileURL: URL, recording: RecordingMetadata, reprocess: Bool = false) async throws -> AnkerCoreUploadResult {
         guard let endpoint = URL(string: Self.savedEndpoint), endpoint.scheme == "https" else {
             throw AnkerCoreUploadError.invalidEndpoint
         }
@@ -165,6 +165,7 @@ struct AnkerCoreUploadClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(String(recording.id), forHTTPHeaderField: "X-AnkerCore-File-ID")
         request.setValue(ISO8601DateFormatter().string(from: recording.recordedAt), forHTTPHeaderField: "X-AnkerCore-Recorded-At")
+        if reprocess { request.setValue("true", forHTTPHeaderField: "X-AnkerCore-Reprocess") }
         let webhookURL = Self.savedWebhookURL
         if !webhookURL.isEmpty { request.setValue(webhookURL, forHTTPHeaderField: "X-AnkerCore-Webhook") }
 
@@ -203,7 +204,8 @@ struct AnkerCoreUploadClient {
     func routeTranscript(
         _ transcript: String,
         analysis: OnDeviceAnalysis?,
-        recording: RecordingMetadata
+        recording: RecordingMetadata,
+        reprocess: Bool = false
     ) async throws -> AnkerCoreUploadResult {
         guard let audioEndpoint = URL(string: Self.savedEndpoint), audioEndpoint.scheme == "https" else {
             throw AnkerCoreUploadError.invalidEndpoint
@@ -219,6 +221,7 @@ struct AnkerCoreUploadClient {
             "file_id": String(recording.id),
             "recorded_at": ISO8601DateFormatter().string(from: recording.recordedAt),
             "transcript": String(transcript.prefix(30_000)),
+            "reprocess": reprocess,
         ]
         let webhookURL = Self.savedWebhookURL
         if !webhookURL.isEmpty { payload["webhook_url"] = webhookURL }
