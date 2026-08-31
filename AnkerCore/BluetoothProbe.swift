@@ -111,6 +111,8 @@ final class BluetoothProbe: NSObject, ObservableObject {
     private var transferExpectedBytes = 0
     private var transferReceivedBytes = 0
     private var lastLoggedTransferBucket = -1
+    private var freshSessionRetryIDs: Set<UInt32> = []
+    private var pendingFreshSessionRetryIDs: Set<UInt32> = []
     private let uploadClient = AnkerCoreUploadClient()
     private let onDeviceProcessor = OnDeviceProcessor()
     private var lastAutoRequestedID: UInt32?
@@ -329,7 +331,11 @@ final class BluetoothProbe: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    func fetchRecording(_ recording: RecordingMetadata) {
+    func fetchRecording(_ recording: RecordingMetadata, automaticSecureRetry: Bool = false) {
+        if !automaticSecureRetry {
+            freshSessionRetryIDs.remove(recording.id)
+        }
+        pendingFreshSessionRetryIDs.remove(recording.id)
         if recordingsLoading {
             finishRecordingListRequest()
             recordingListState = recordings.isEmpty
@@ -370,17 +376,16 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferProgress = 0
         transferState = "Preparing secure transfer…"
 
-        if secureSession.isReady {
-            requestPendingRecording()
-        } else {
-            let publicKey = secureSession.beginHandshake()
-            guard sendKnownCommand(type: 0x2E, id: 0x01, payload: publicKey) else {
-                suspendTransferForReconnect()
-                scheduleReconnect(to: connectedPeripheral ?? savedRecorder())
-                return
-            }
-            record(kind: "secure-transfer", summary: "Requested an ephemeral encrypted session")
+        // A device-side session can expire while Bluetooth remains connected. Starting every
+        // transfer with a new ephemeral key prevents retries from reusing a rejected file key.
+        secureSession.reset()
+        let publicKey = secureSession.beginHandshake()
+        guard sendKnownCommand(type: 0x2E, id: 0x01, payload: publicKey) else {
+            suspendTransferForReconnect()
+            scheduleReconnect(to: connectedPeripheral ?? savedRecorder())
+            return
         }
+        record(kind: "secure-transfer", summary: "Requested a fresh ephemeral encrypted session")
     }
 
     func saveUploadConfiguration(endpoint: String, token: String, webhookURL: String = "") -> String? {
@@ -535,6 +540,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         processingRecordingIDs.contains(recording.id)
             || pendingTransfer?.id == recording.id
             || reconnectFetches[recording.id] != nil
+            || pendingFreshSessionRetryIDs.contains(recording.id)
     }
 
     func canReprocess(_ recording: RecordingMetadata) -> Bool {
@@ -868,9 +874,11 @@ final class BluetoothProbe: NSObject, ObservableObject {
               payload.count >= 87,
               let fileID = Self.littleEndianUInt32(payload, at: 0),
               let size = Self.littleEndianUInt32(payload, at: 4),
-              fileID == target.id,
-              payload[86] == 0
+              fileID == target.id
         else { throw D3200CryptoError.invalidFileKey }
+        guard payload[86] == 0 else {
+            throw D3200CryptoError.recorderRejectedFile(payload[86])
+        }
 
         let nonce = Data(payload[8 ..< 24])
         let encryptedFileKey = Data(payload[24 ..< 70])
@@ -970,6 +978,8 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
         transferProgress = 1
         downloadedRecordings[target.id] = finalURL
+        freshSessionRetryIDs.remove(target.id)
+        pendingFreshSessionRetryIDs.remove(target.id)
         if conversionSucceeded, finalURL.pathExtension == "ogg" {
             transferState = "Saved playable audio securely on this iPhone"
             appendProcessingEvent(
@@ -1395,7 +1405,29 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferURL = nil
         transferFileKey = nil
         transferNonce = nil
+        secureSession.reset()
         if let failedRecording {
+            if freshSessionRetryIDs.insert(failedRecording.id).inserted {
+                pendingFreshSessionRetryIDs.insert(failedRecording.id)
+                transferState = "Refreshing secure connection…"
+                uploadState = "Secure transfer interrupted — retrying automatically…"
+                appendProcessingEvent(
+                    recording: failedRecording,
+                    stage: .fetch,
+                    state: .waiting,
+                    title: "Refreshing secure connection",
+                    detail: "The recorder rejected the previous encrypted session. AnkerCore will negotiate a new session and retry once."
+                )
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+                    guard let self,
+                          self.pendingFreshSessionRetryIDs.remove(failedRecording.id) != nil
+                    else { return }
+                    self.fetchRecording(failedRecording, automaticSecureRetry: true)
+                }
+                return
+            }
+            freshSessionRetryIDs.remove(failedRecording.id)
+            pendingFreshSessionRetryIDs.remove(failedRecording.id)
             pendingReprocessIDs.remove(failedRecording.id)
             appendProcessingEvent(
                 recording: failedRecording,
@@ -1599,6 +1631,14 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
         if message.localizedCaseInsensitiveContains("command channel") {
             return "The recorder command channel was unavailable. Reconnect and retry."
+        }
+        if message.localizedCaseInsensitiveContains("rejected the file request") {
+            return "Soundcore Work rejected this recording after a fresh secure retry. It may still be finalizing, busy, or no longer stored on the recorder."
+        }
+        if message.localizedCaseInsensitiveContains("secure-session")
+            || message.localizedCaseInsensitiveContains("recording key")
+            || message.localizedCaseInsensitiveContains("decryption failed") {
+            return "The fresh encrypted session could not be verified by Soundcore Work. Reconnect the recorder and retry."
         }
         return "The secure audio transfer could not be completed. Reconnect and retry."
     }

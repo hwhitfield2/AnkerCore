@@ -6,6 +6,7 @@ enum D3200CryptoError: LocalizedError {
     case malformedHandshake
     case keyAgreementFailed
     case invalidFileKey
+    case recorderRejectedFile(UInt8)
     case cipherFailure(CCCryptorStatus)
 
     var errorDescription: String? {
@@ -13,6 +14,7 @@ enum D3200CryptoError: LocalizedError {
         case .malformedHandshake: "The recorder returned an invalid secure-session response."
         case .keyAgreementFailed: "The recorder's secure-session verification failed."
         case .invalidFileKey: "The recording key could not be verified."
+        case let .recorderRejectedFile(code): "The recorder rejected the file request (code \(code))."
         case let .cipherFailure(status): "Audio decryption failed (status \(status))."
         }
     }
