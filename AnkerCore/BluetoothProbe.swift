@@ -59,6 +59,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var uploadState = "Paste the private token once to enable automatic processing"
     @Published private(set) var uploadEndpoint = AnkerCoreUploadClient.savedEndpoint
     @Published private(set) var uploadConfigured = AnkerCoreUploadClient.hasToken
+    @Published private(set) var connectionCheckState = "Connection has not been tested"
     @Published private(set) var lastDestinationURL: URL?
     @Published private(set) var processingMode = "On-device preferred"
     @Published private(set) var openTasks: [AnkerCoreTask] = []
@@ -110,6 +111,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         record(kind: "capture", summary: "Started a new local diagnostic capture")
         restoreDownloadedRecordings()
         reloadVoiceProfiles()
+        if uploadConfigured { testUploadConnection() }
     }
 
     deinit {
@@ -228,6 +230,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
             uploadState = AnkerCoreUploadClient.savedWebhookURL.isEmpty
                 ? "Automatic processing is ready"
                 : "Automatic processing and webhook delivery are ready"
+            testUploadConnection()
             refreshTasks()
             return nil
         } catch {
@@ -263,6 +266,33 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 await MainActor.run {
                     tasksState = error.localizedDescription
                     tasksLoading = false
+                }
+            }
+        }
+    }
+
+    func testUploadConnection() {
+        guard uploadConfigured else {
+            connectionCheckState = "Save the private connection first"
+            return
+        }
+        connectionCheckState = "Testing Worker and Notion access…"
+        Task {
+            do {
+                let diagnostics = try await uploadClient.routingDiagnostics()
+                await MainActor.run {
+                    if diagnostics.ok {
+                        connectionCheckState = "Worker authenticated · Notion routing ready"
+                    } else {
+                        connectionCheckState = "Notion configuration needs repair"
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    connectionCheckState = Self.safeProcessingFailure(
+                        error,
+                        fallback: "The iPhone could not reach the configured Worker."
+                    )
                 }
             }
         }
@@ -1153,6 +1183,24 @@ final class BluetoothProbe: NSObject, ObservableObject {
     }
 
     private static func safeProcessingFailure(_ error: Error, fallback: String) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "The Worker connection timed out. Check the service URL and try again."
+            case .cannotFindHost:
+                return "The configured Worker hostname could not be found. Check the service URL."
+            case .cannotConnectToHost:
+                return "The iPhone could not connect to the configured Worker."
+            case .notConnectedToInternet:
+                return "The iPhone is not connected to the internet."
+            case .networkConnectionLost:
+                return "The Worker connection was interrupted. Try again."
+            case .secureConnectionFailed, .serverCertificateUntrusted:
+                return "The configured Worker did not provide a trusted secure connection."
+            default:
+                return fallback
+            }
+        }
         guard let uploadError = error as? AnkerCoreUploadError else { return fallback }
         switch uploadError {
         case .invalidEndpoint:
@@ -1161,8 +1209,23 @@ final class BluetoothProbe: NSObject, ObservableObject {
             return "The private upload token is missing. Update it in Settings and retry."
         case .invalidResponse:
             return "The configured Worker returned an invalid response."
-        case .rejected:
-            return "The configured Worker rejected or could not complete the request."
+        case .rejected(let reason):
+            switch reason {
+            case "unauthorized":
+                return "The private upload token is no longer accepted. Paste the current token in Settings."
+            case "upload_not_configured":
+                return "The configured Worker does not have an upload token. Check the service URL."
+            case "notion_schema_mismatch":
+                return "The Notion databases need a schema repair before this recording can be routed."
+            case "notion_access_denied":
+                return "The Notion integration no longer has access to one or more routing databases."
+            case "notion_target_missing":
+                return "A configured Notion page or database could not be found."
+            case "notion_rate_limited":
+                return "Notion temporarily rate-limited routing. Wait briefly, then retry."
+            default:
+                return "The configured Worker rejected or could not complete the request."
+            }
         case .keychain:
             return "The private credential could not be read from the iPhone Keychain."
         }

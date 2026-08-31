@@ -72,6 +72,11 @@ private struct AnkerCoreTaskMutation: Decodable {
     let task: AnkerCoreTask
 }
 
+struct AnkerCoreRoutingDiagnostics: Decodable {
+    let ok: Bool
+    let issues: [String]
+}
+
 enum AnkerCoreUploadError: LocalizedError {
     case invalidEndpoint
     case missingToken
@@ -198,6 +203,17 @@ struct AnkerCoreUploadClient {
             throw AnkerCoreUploadError.rejected("task_update_failed")
         }
         return try JSONDecoder().decode(AnkerCoreTaskMutation.self, from: data).task
+    }
+
+    func routingDiagnostics() async throws -> AnkerCoreRoutingDiagnostics {
+        let request = try authorizedRequest(path: "/diagnostics/routing", method: "GET")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw AnkerCoreUploadError.invalidResponse }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            let reason = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            throw AnkerCoreUploadError.rejected(reason ?? "HTTP \(http.statusCode)")
+        }
+        return try JSONDecoder().decode(AnkerCoreRoutingDiagnostics.self, from: data)
     }
 
     @available(iOS 26.0, *)

@@ -87,6 +87,11 @@ test("task endpoints require authentication", async () => {
   assert.equal(result.status, 401);
 });
 
+test("routing diagnostics require authentication", async () => {
+  const result = await worker.fetch(new Request("https://example.test/diagnostics/routing"), environment(), {});
+  assert.equal(result.status, 401);
+});
+
 test("explicit reprocessing bypasses source dedupe and reuses routed artifacts", async () => {
   const originalFetch = globalThis.fetch;
   const created = [];

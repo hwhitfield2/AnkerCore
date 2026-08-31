@@ -852,6 +852,14 @@ private struct SettingsView: View {
                         if configurationError == nil { uploadToken = "" }
                     }
                     if probe.uploadConfigured {
+                        Button("Test connection") { probe.testUploadConnection() }
+                        Text(probe.connectionCheckState)
+                            .font(.caption)
+                            .foregroundStyle(
+                                probe.connectionCheckState.contains("ready")
+                                    ? RelayPalette.mint
+                                    : RelayPalette.secondaryText
+                            )
                         Button("Remove private token", role: .destructive) {
                             probe.clearUploadToken()
                             uploadToken = ""

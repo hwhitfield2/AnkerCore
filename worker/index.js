@@ -23,6 +23,11 @@ export default {
       return receiveTranscript(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/diagnostics/routing") {
+      const authFailure = uploadAuthorizationFailure(request, env);
+      return authFailure || routingDiagnostics(env);
+    }
+
     if (request.method === "GET" && url.pathname === "/tasks") {
       const authFailure = uploadAuthorizationFailure(request, env);
       return authFailure || listOpenTasks(env);
@@ -162,7 +167,12 @@ async function receiveAudio(request, env) {
     });
   }
 
-  const routed = await routePage(inboxPage.id, env, null, { reprocess });
+  let routed;
+  try {
+    routed = await routePage(inboxPage.id, env, null, { reprocess });
+  } catch (error) {
+    return json({ ok: false, error: safeErrorCode(error) }, 502);
+  }
   const webhook = await deliverWebhook(webhookURL, transcript, recorded, fileId, routed);
   return json({
     ok: true,
@@ -231,7 +241,12 @@ async function receiveTranscript(request, env) {
     });
   }
 
-  const routed = await routePage(inboxPage.id, env, suppliedAnalysis, { reprocess });
+  let routed;
+  try {
+    routed = await routePage(inboxPage.id, env, suppliedAnalysis, { reprocess });
+  } catch (error) {
+    return json({ ok: false, error: safeErrorCode(error) }, 502);
+  }
   const webhook = await deliverWebhook(webhookURL, transcript, recorded, fileId, routed);
   return json({
     ok: true,
@@ -753,10 +768,48 @@ async function finishProcessingItem(pageId, status, destinations, error, env) {
 }
 
 function safeErrorCode(error) {
+  if (error instanceof NotionRequestError) {
+    if (error.status === 400) return "notion_schema_mismatch";
+    if (error.status === 401 || error.status === 403) return "notion_access_denied";
+    if (error.status === 404) return "notion_target_missing";
+    if (error.status === 429) return "notion_rate_limited";
+    return "notion_request_failed";
+  }
   const message = String(error?.message || "routing_failed").toLowerCase();
   if (message.includes("notion")) return "notion_request_failed";
   if (message.includes("destination")) return "destination_unavailable";
   return "routing_failed";
+}
+
+async function routingDiagnostics(env) {
+  const databases = [
+    ["meetings", env.MEETINGS_DATABASE_ID, { Name: "title", Recorded: "date", Participants: "rich_text", Summary: "rich_text", Decisions: "rich_text", "Open Questions": "rich_text", "Follow-up": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text" }],
+    ["tasks", env.TASKS_DATABASE_ID, { Name: "title", Status: "status", Due: "date", Priority: "select", Owner: "rich_text", Summary: "rich_text", "Source Quote": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text" }],
+    ["ideas", env.IDEAS_DATABASE_ID, { Name: "title", Recorded: "date", Topic: "select", Summary: "rich_text", "Why It Matters": "rich_text", "Next Experiment": "rich_text", Area: "select", "AI Area": "select", "AI Type": "select", "AI Confidence": "number", Source: "url", "Artifact Key": "rich_text" }],
+    ["recent", env.RECENT_DATABASE_ID, { Name: "title", Status: "select", Type: "select", Area: "select", Recorded: "date", "AI Confidence": "number", Database: "url", Destination: "url", Source: "url" }],
+    ["processing", env.PROCESSING_DATABASE_ID, { Name: "title", "Recording ID": "rich_text", Status: "select", Completed: "date", Mode: "select", Items: "number", Error: "rich_text", Source: "url", Destinations: "rich_text" }],
+  ];
+  const issues = [];
+  if (!env.NOTION_TOKEN) issues.push("notion:token_missing");
+  if (!env.INBOX_PAGE_ID) issues.push("inbox:binding_missing");
+
+  for (const [label, databaseId, expected] of databases) {
+    if (!databaseId) {
+      issues.push(`${label}:binding_missing`);
+      continue;
+    }
+    try {
+      const database = await notion(env, `/databases/${databaseId}`);
+      for (const [name, type] of Object.entries(expected)) {
+        const actual = database?.properties?.[name]?.type;
+        if (!actual) issues.push(`${label}.${name}:missing`);
+        else if (actual !== type) issues.push(`${label}.${name}:expected_${type}_found_${actual}`);
+      }
+    } catch (error) {
+      issues.push(`${label}:${safeErrorCode(error)}`);
+    }
+  }
+  return json({ ok: issues.length === 0, issues });
 }
 
 async function findByArtifactKey(databaseId, artifactKey, env) {
@@ -1370,6 +1423,14 @@ function relationProperty(databaseId) {
   return { relation: { database_id: databaseId, type: "single_property", single_property: {} } };
 }
 
+class NotionRequestError extends Error {
+  constructor(status, code) {
+    super("Notion request failed");
+    this.status = status;
+    this.code = code;
+  }
+}
+
 async function notion(env, path, init = {}) {
   const response = await fetch(`https://api.notion.com/v1${path}`, {
     ...init,
@@ -1380,7 +1441,14 @@ async function notion(env, path, init = {}) {
       ...(init.headers || {}),
     },
   });
-  if (!response.ok) throw new Error(`Notion request failed (${response.status})`);
+  if (!response.ok) {
+    let code = "unknown";
+    try {
+      const body = await response.clone().json();
+      if (/^[a-z0-9_]{1,80}$/i.test(String(body?.code || ""))) code = String(body.code);
+    } catch { /* Keep diagnostics sanitized. */ }
+    throw new NotionRequestError(response.status, code);
+  }
   return response.json();
 }
 
