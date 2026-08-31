@@ -203,6 +203,8 @@ The first enrollment downloads FluidAudio's diarization models. Mathematical voi
 
 The authenticated `GET /tasks` endpoint powers the app's running open-task list. `POST /tasks/{page-id}/complete` verifies that the page belongs to the configured Tasks database before marking it done. The Processing Log records stages, mode, item count, destinations, and sanitized errors without copying transcript or audio content.
 
+The iPhone app also keeps a separate per-recording processing timeline. The Relay screen shows the six most recent recordings with live states for secure fetch, on-device or fallback transcription, AI sorting, Notion routing, and optional webhook delivery. Tap a timeline to see timestamps and direct links to every returned Notion item and database. Up to 100 timelines with 50 events each are stored locally with file protection and excluded from backup; Settings can clear this history without deleting audio or Notion records. Timeline entries never contain audio data, transcript text, credentials, webhook URLs, or cryptographic material.
+
 The Worker cron in `wrangler.jsonc` creates an idempotent Daily Digest at 14:00 UTC (07:00 in Arizona) with open, due, overdue, and needs-review actions. Change the cron for another local time. An authenticated `POST /digest` can generate today's digest on demand.
 
 When a user corrects the Area on a routed Notion page, the signed Notion `page.properties_updated` webhook records the correction in Routing Feedback. Learned corrections are supplied as untrusted examples to later cloud classifications, creating an auditable feedback loop without modifying or uploading voice profiles.

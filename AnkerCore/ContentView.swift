@@ -16,6 +16,7 @@ struct ContentView: View {
                         tasksCard
                         connectionCard
                         pipelineCard
+                        processingHistoryCard
                         recordingsCard
                         nearbyDevicesCard
                     }
@@ -260,6 +261,34 @@ struct ContentView: View {
         }
     }
 
+    private var recentProcessingLogs: [RecordingProcessingLog] {
+        Array(probe.processingLogs.values.sorted { $0.recordedAt > $1.recordedAt }.prefix(6))
+    }
+
+    private var processingHistoryCard: some View {
+        RelayCard(title: "Processing log", icon: "clock.arrow.circlepath") {
+            VStack(spacing: 12) {
+                if recentProcessingLogs.isEmpty {
+                    HStack(spacing: 12) {
+                        Image(systemName: "list.bullet.rectangle")
+                            .font(.title3)
+                            .foregroundStyle(RelayPalette.secondaryText)
+                        Text("Each fetched recording will build a live timeline here.")
+                            .font(.subheadline)
+                            .foregroundStyle(RelayPalette.secondaryText)
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
+                } else {
+                    ForEach(Array(recentProcessingLogs.enumerated()), id: \.element.id) { index, log in
+                        if index > 0 { Divider().overlay(RelayPalette.stroke) }
+                        ProcessingHistoryRow(probe: probe, log: log)
+                    }
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private var nearbyDevicesCard: some View {
         if probe.connectedPeripheralID == nil, !probe.devices.isEmpty {
@@ -384,20 +413,37 @@ private struct RecordingRow: View {
     @ObservedObject var probe: BluetoothProbe
     let recording: RecordingMetadata
     @State private var showingEnrollment = false
+    @State private var showingProcessingLog = false
+
+    private var processingLog: RecordingProcessingLog? { probe.processingLog(for: recording.id) }
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: probe.downloadedRecordings[recording.id] == nil ? "waveform.circle" : "checkmark.circle.fill")
+            Image(systemName: processingLog?.state.symbolName ?? (probe.downloadedRecordings[recording.id] == nil ? "waveform.circle" : "checkmark.circle.fill"))
                 .font(.title2)
-                .foregroundStyle(probe.downloadedRecordings[recording.id] == nil ? RelayPalette.sky : RelayPalette.mint)
+                .foregroundStyle(processingLog?.state.tintColor ?? (probe.downloadedRecordings[recording.id] == nil ? RelayPalette.sky : RelayPalette.mint))
             VStack(alignment: .leading, spacing: 3) {
                 Text(recording.recordedAt, format: .dateTime.month(.abbreviated).day().hour().minute())
                     .font(.subheadline.weight(.semibold))
-                Text(ByteCountFormatter.string(fromByteCount: Int64(recording.sizeBytes), countStyle: .file))
+                if recording.sizeBytes > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(recording.sizeBytes), countStyle: .file))
+                        .font(.caption)
+                        .foregroundStyle(RelayPalette.secondaryText)
+                }
+                Text(processingLog?.summary ?? "Not processed on this iPhone")
                     .font(.caption)
-                    .foregroundStyle(RelayPalette.secondaryText)
+                    .foregroundStyle(processingLog?.state.tintColor ?? RelayPalette.secondaryText)
+                    .lineLimit(2)
             }
             Spacer()
+            if processingLog != nil {
+                Button { showingProcessingLog = true } label: {
+                    Image(systemName: "list.bullet.rectangle.portrait")
+                        .frame(width: 36, height: 36)
+                        .background(RelayPalette.surfaceRaised, in: Circle())
+                }
+                .accessibilityLabel("View processing log")
+            }
             if let url = probe.downloadedRecordings[recording.id] {
                 HStack(spacing: 5) {
                     Button { showingEnrollment = true } label: {
@@ -423,6 +469,176 @@ private struct RecordingRow: View {
             VoiceEnrollmentView(probe: probe, recording: recording)
                 .presentationDragIndicator(.visible)
                 .presentationBackground(RelayPalette.background)
+        }
+        .sheet(isPresented: $showingProcessingLog) {
+            ProcessingLogView(probe: probe, recording: recording)
+                .presentationDragIndicator(.visible)
+                .presentationDetents([.medium, .large])
+                .presentationBackground(RelayPalette.background)
+        }
+    }
+}
+
+private struct ProcessingHistoryRow: View {
+    @ObservedObject var probe: BluetoothProbe
+    let log: RecordingProcessingLog
+    @State private var showingProcessingLog = false
+
+    private var recording: RecordingMetadata {
+        RecordingMetadata(id: log.id, endTime: nil, sizeBytes: 0)
+    }
+
+    var body: some View {
+        Button { showingProcessingLog = true } label: {
+            HStack(spacing: 12) {
+                Image(systemName: log.state.symbolName)
+                    .font(.title3)
+                    .foregroundStyle(log.state.tintColor)
+                    .frame(width: 38, height: 38)
+                    .background(log.state.tintColor.opacity(0.1), in: Circle())
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(log.recordedAt, format: .dateTime.month(.abbreviated).day().hour().minute())
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                    Text(log.summary)
+                        .font(.caption)
+                        .foregroundStyle(log.state.tintColor)
+                        .lineLimit(2)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(RelayPalette.secondaryText)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .sheet(isPresented: $showingProcessingLog) {
+            ProcessingLogView(probe: probe, recording: recording)
+                .presentationDragIndicator(.visible)
+                .presentationDetents([.medium, .large])
+                .presentationBackground(RelayPalette.background)
+        }
+    }
+}
+
+private struct ProcessingLogView: View {
+    @ObservedObject var probe: BluetoothProbe
+    let recording: RecordingMetadata
+    @Environment(\.dismiss) private var dismiss
+
+    private var log: RecordingProcessingLog? { probe.processingLog(for: recording.id) }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                RelayPalette.background.ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(recording.recordedAt, format: .dateTime.month(.wide).day().year().hour().minute())
+                                        .font(.headline)
+                                    Text("Recording \(recording.id)")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(RelayPalette.secondaryText)
+                                }
+                                Spacer()
+                                if let log {
+                                    StatusPill(icon: log.state.symbolName, title: log.state.label, color: log.state.tintColor)
+                                }
+                            }
+                            Text("Operational events only. Audio, transcript text, credentials, webhook URLs, and cryptographic keys are never stored here.")
+                                .font(.caption)
+                                .foregroundStyle(RelayPalette.secondaryText)
+                        }
+                        .padding(18)
+                        .background(RelayPalette.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(RelayPalette.stroke, lineWidth: 1))
+
+                        if let log, !log.events.isEmpty {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(Array(log.events.enumerated()), id: \.element.id) { index, event in
+                                    ProcessingEventRow(event: event, showsLine: index < log.events.count - 1)
+                                }
+                            }
+                        } else {
+                            ContentUnavailableView(
+                                "No processing events",
+                                systemImage: "list.bullet.rectangle",
+                                description: Text("Fetch this recording to begin its processing timeline.")
+                            )
+                            .foregroundStyle(RelayPalette.secondaryText)
+                        }
+                    }
+                    .padding(18)
+                }
+                .scrollIndicators(.hidden)
+            }
+            .navigationTitle("Processing log")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }.fontWeight(.semibold)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .tint(RelayPalette.coral)
+    }
+}
+
+private struct ProcessingEventRow: View {
+    let event: RecordingProcessingEvent
+    let showsLine: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 13) {
+            VStack(spacing: 0) {
+                Image(systemName: event.stage.symbolName)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(event.state.tintColor)
+                    .frame(width: 34, height: 34)
+                    .background(event.state.tintColor.opacity(0.12), in: Circle())
+                if showsLine {
+                    Rectangle()
+                        .fill(RelayPalette.stroke)
+                        .frame(width: 2, height: event.links.isEmpty ? 54 : 86)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(event.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Text(event.timestamp, style: .time)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(RelayPalette.secondaryText)
+                }
+                Text(event.stage.label.uppercased())
+                    .font(.caption2.weight(.black))
+                    .tracking(1.1)
+                    .foregroundStyle(event.state.tintColor)
+                Text(event.detail)
+                    .font(.caption)
+                    .foregroundStyle(RelayPalette.secondaryText)
+
+                ForEach(event.links) { link in
+                    Link(destination: link.url) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.up.right.square")
+                            Text(link.title).lineLimit(1)
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(RelayPalette.sky)
+                    }
+                }
+            }
+            .padding(.top, 4)
+            .padding(.bottom, showsLine ? 16 : 0)
         }
     }
 }
@@ -564,6 +780,7 @@ private struct SettingsView: View {
     @State private var webhookURL = AnkerCoreUploadClient.savedWebhookURL
     @State private var uploadToken = ""
     @State private var configurationError: String?
+    @State private var confirmingHistoryClear = false
 
     var body: some View {
         NavigationStack {
@@ -649,6 +866,18 @@ private struct SettingsView: View {
                     Label("Unknown or uncertain voices keep generic Speaker labels", systemImage: "questionmark.circle.fill")
                 }
 
+                Section("Processing history") {
+                    LabeledContent("Recordings retained", value: String(probe.processingLogs.count))
+                    Text("Up to 100 sanitized recording timelines are kept locally with file protection and excluded from backup.")
+                        .font(.caption)
+                        .foregroundStyle(RelayPalette.secondaryText)
+                    if !probe.processingLogs.isEmpty {
+                        Button("Clear processing history", role: .destructive) {
+                            confirmingHistoryClear = true
+                        }
+                    }
+                }
+
                 Section("Diagnostics") {
                     LabeledContent("Bluetooth", value: probe.bluetoothState)
                     LabeledContent("Connection", value: probe.connectionState)
@@ -684,6 +913,12 @@ private struct SettingsView: View {
                     Button("Done") { dismiss() }.fontWeight(.semibold)
                 }
             }
+            .alert("Clear processing history?", isPresented: $confirmingHistoryClear) {
+                Button("Cancel", role: .cancel) {}
+                Button("Clear", role: .destructive) { probe.clearProcessingHistory() }
+            } message: {
+                Text("This removes local event timelines and links. It does not delete recordings or Notion items.")
+            }
         }
         .preferredColorScheme(.dark)
         .tint(RelayPalette.coral)
@@ -716,4 +951,59 @@ private enum RelayPalette {
     static let mint = Color(red: 0.37, green: 0.91, blue: 0.68)
     static let sky = Color(red: 0.38, green: 0.73, blue: 1.0)
     static let amber = Color(red: 1.0, green: 0.72, blue: 0.25)
+}
+
+private extension RecordingProcessingState {
+    var label: String {
+        switch self {
+        case .running: "Processing"
+        case .succeeded: "Complete"
+        case .failed: "Failed"
+        case .attention: "Needs attention"
+        case .waiting: "Waiting"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .running: "arrow.triangle.2.circlepath.circle.fill"
+        case .succeeded: "checkmark.circle.fill"
+        case .failed: "xmark.octagon.fill"
+        case .attention: "exclamationmark.triangle.fill"
+        case .waiting: "clock.fill"
+        }
+    }
+
+    var tintColor: Color {
+        switch self {
+        case .running: RelayPalette.sky
+        case .succeeded: RelayPalette.mint
+        case .failed: RelayPalette.coral
+        case .attention, .waiting: RelayPalette.amber
+        }
+    }
+}
+
+private extension RecordingProcessingStage {
+    var label: String {
+        switch self {
+        case .capture: "Capture"
+        case .fetch: "Audio fetch"
+        case .transcription: "Transcription"
+        case .classification: "AI sorting"
+        case .routing: "Notion routing"
+        case .delivery: "Webhook delivery"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .capture: "waveform.badge.mic"
+        case .fetch: "arrow.down.circle.fill"
+        case .transcription: "text.bubble.fill"
+        case .classification: "sparkles"
+        case .routing: "point.3.connected.trianglepath.dotted"
+        case .delivery: "paperplane.fill"
+        }
+    }
 }

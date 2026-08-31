@@ -17,6 +17,7 @@
 		A10000000000000000000008 /* OnDeviceProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* OnDeviceProcessor.swift */; };
 		A10000000000000000000009 /* VoiceIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* VoiceIdentity.swift */; };
 		A1000000000000000000000A /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* PrivacyInfo.xcprivacy */; };
+		A1000000000000000000000B /* ProcessingLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* ProcessingLog.swift */; };
 		B10000000000000000000001 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = B30000000000000000000001 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
@@ -34,6 +35,7 @@
 		A20000000000000000000011 /* OnDeviceProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnDeviceProcessor.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* VoiceIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceIdentity.swift; sourceTree = "<group>"; };
 		A20000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		A20000000000000000000014 /* ProcessingLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessingLog.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -68,6 +70,7 @@
 				A20000000000000000000009 /* UploadClient.swift */,
 				A20000000000000000000011 /* OnDeviceProcessor.swift */,
 				A20000000000000000000012 /* VoiceIdentity.swift */,
+				A20000000000000000000014 /* ProcessingLog.swift */,
 				A20000000000000000000010 /* Assets.xcassets */,
 				A20000000000000000000013 /* PrivacyInfo.xcprivacy */,
 				A20000000000000000000004 /* Info.plist */,
@@ -168,6 +171,7 @@
 				A10000000000000000000006 /* UploadClient.swift in Sources */,
 				A10000000000000000000008 /* OnDeviceProcessor.swift in Sources */,
 				A10000000000000000000009 /* VoiceIdentity.swift in Sources */,
+				A1000000000000000000000B /* ProcessingLog.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

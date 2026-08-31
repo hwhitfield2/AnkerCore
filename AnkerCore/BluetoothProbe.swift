@@ -66,6 +66,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @Published private(set) var tasksLoading = false
     @Published private(set) var voiceProfiles: [VoiceProfile] = []
     @Published private(set) var voiceIdentityState = "No voice profiles enrolled"
+    @Published private(set) var processingLogs = ProcessingLogPersistence.load()
 
     var canScan: Bool { central?.state == .poweredOn }
     var canLoadRecordings: Bool { writeCharacteristic != nil }
@@ -181,8 +182,22 @@ final class BluetoothProbe: NSObject, ObservableObject {
     func fetchRecording(_ recording: RecordingMetadata) {
         guard transferHandle == nil else {
             transferState = "Another transfer is already active"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .fetch,
+                state: .attention,
+                title: "Fetch not started",
+                detail: "Another recording transfer is already active. Try again when it finishes."
+            )
             return
         }
+        appendProcessingEvent(
+            recording: recording,
+            stage: .fetch,
+            state: .running,
+            title: "Fetching recording",
+            detail: "Preparing an encrypted transfer from Soundcore Work."
+        )
         pendingTransfer = recording
         transferExpectedBytes = Int(recording.sizeBytes)
         transferReceivedBytes = 0
@@ -313,6 +328,15 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 await MainActor.run { voiceIdentityState = error.localizedDescription }
             }
         }
+    }
+
+    func processingLog(for recordingID: UInt32) -> RecordingProcessingLog? {
+        processingLogs[recordingID]
+    }
+
+    func clearProcessingHistory() {
+        processingLogs = [:]
+        ProcessingLogPersistence.clear()
     }
 
     func startNewCapture() {
@@ -617,6 +641,13 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferURL = url
         transferHandle = try FileHandle(forWritingTo: url)
         transferState = "Downloading and decrypting…"
+        appendProcessingEvent(
+            recording: target,
+            stage: .fetch,
+            state: .running,
+            title: "Secure transfer established",
+            detail: "Downloading and decrypting the recording on this iPhone."
+        )
     }
 
     private func appendTransferSlices(from payload: Data) throws {
@@ -659,6 +690,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         try? transferHandle?.close()
         transferHandle = nil
         var finalURL = rawURL
+        var conversionSucceeded = false
         do {
             let rawAudio = try Data(contentsOf: rawURL)
             let oggAudio = try OggOpusMuxer.mux(rawFrames: rawAudio)
@@ -674,17 +706,34 @@ final class BluetoothProbe: NSObject, ObservableObject {
             try? protectedURL.setResourceValues(values)
             try FileManager.default.removeItem(at: rawURL)
             finalURL = oggURL
+            conversionSucceeded = true
         } catch {
             // Preserve the decrypted raw file if container creation ever fails.
             transferState = "Saved raw audio; playable conversion failed"
         }
         transferProgress = 1
         downloadedRecordings[target.id] = finalURL
-        if finalURL.pathExtension == "ogg" {
+        if conversionSucceeded, finalURL.pathExtension == "ogg" {
             transferState = "Saved playable audio securely on this iPhone"
+            appendProcessingEvent(
+                recording: target,
+                stage: .fetch,
+                state: .succeeded,
+                title: "Recording fetched",
+                detail: "The playable audio file was saved securely on this iPhone."
+            )
             uploadRecording(finalURL, recording: target)
+            record(kind: "secure-transfer", summary: "Saved playable file \(target.id) locally; audio omitted from capture")
+        } else {
+            appendProcessingEvent(
+                recording: target,
+                stage: .fetch,
+                state: .failed,
+                title: "Audio conversion failed",
+                detail: "The encrypted recording was fetched, but a playable audio file could not be created."
+            )
+            record(kind: "secure-transfer", summary: "Saved raw file \(target.id) locally; audio omitted from capture")
         }
-        record(kind: "secure-transfer", summary: "Saved playable file \(target.id) locally; audio omitted from capture")
         pendingTransfer = nil
         transferURL = nil
         transferFileKey = nil
@@ -694,25 +743,64 @@ final class BluetoothProbe: NSObject, ObservableObject {
     private func uploadRecording(_ fileURL: URL, recording: RecordingMetadata) {
         guard uploadConfigured else {
             uploadState = "Saved locally — add the private token to process automatically"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .routing,
+                state: .waiting,
+                title: "Waiting for cloud connection",
+                detail: "The audio is saved locally. Add the private Worker connection to process it."
+            )
             return
         }
         uploadState = "Transcribing on this iPhone…"
         processingMode = "On-device preferred"
         lastDestinationURL = nil
+        appendProcessingEvent(
+            recording: recording,
+            stage: .transcription,
+            state: .running,
+            title: "On-device transcription started",
+            detail: "AnkerCore is attempting to transcribe the recording without uploading audio."
+        )
         Task {
             let transcript: String
             do {
                 transcript = try await onDeviceProcessor.transcribe(fileURL: fileURL)
+                await MainActor.run {
+                    self.appendProcessingEvent(
+                        recording: recording,
+                        stage: .transcription,
+                        state: .succeeded,
+                        title: "On-device transcription complete",
+                        detail: "Speech was transcribed on this iPhone; transcript content is omitted from this log."
+                    )
+                }
             } catch {
                 await MainActor.run {
                     uploadState = "Local speech unavailable — using cloud transcription…"
                     processingMode = "Cloud transcription fallback"
+                    self.appendProcessingEvent(
+                        recording: recording,
+                        stage: .transcription,
+                        state: .running,
+                        title: "Using cloud transcription fallback",
+                        detail: "The local speech model was unavailable, so the encrypted connection is sending audio to the configured Worker."
+                    )
                 }
                 do {
                     let result = try await uploadClient.upload(fileURL: fileURL, recording: recording)
-                    await applyUploadResult(result, mode: "Cloud transcription fallback")
+                    await applyUploadResult(result, mode: "Cloud transcription fallback", recording: recording)
                 } catch {
-                    await MainActor.run { uploadState = error.localizedDescription }
+                    await MainActor.run {
+                        uploadState = error.localizedDescription
+                        self.appendProcessingEvent(
+                            recording: recording,
+                            stage: .routing,
+                            state: .failed,
+                            title: "Cloud processing failed",
+                            detail: Self.safeProcessingFailure(error, fallback: "The configured Worker could not process this recording.")
+                        )
+                    }
                 }
                 return
             }
@@ -726,30 +814,74 @@ final class BluetoothProbe: NSObject, ObservableObject {
     @available(iOS 26.0, *)
     private func routeLocallyTranscribed(_ transcript: String, recording: RecordingMetadata) async {
         var analysis: OnDeviceAnalysis?
-        await MainActor.run { uploadState = "Sorting on this iPhone…" }
+        await MainActor.run {
+            uploadState = "Sorting on this iPhone…"
+            self.appendProcessingEvent(
+                recording: recording,
+                stage: .classification,
+                state: .running,
+                title: "On-device sorting started",
+                detail: "Classifying meetings, tasks, ideas, and work area on this iPhone."
+            )
+        }
         do {
             analysis = try await onDeviceProcessor.classify(transcript: transcript, recordedAt: recording.recordedAt)
+            await MainActor.run {
+                self.appendProcessingEvent(
+                    recording: recording,
+                    stage: .classification,
+                    state: .succeeded,
+                    title: "On-device sorting complete",
+                    detail: "Structured meeting, task, and idea metadata was created locally."
+                )
+            }
         } catch {
             await MainActor.run {
                 uploadState = "Using transcript-only cloud sorting…"
                 processingMode = "Local transcript · cloud sorting"
+                self.appendProcessingEvent(
+                    recording: recording,
+                    stage: .classification,
+                    state: .running,
+                    title: "Using cloud sorting fallback",
+                    detail: "Only transcript text is being sent to the configured Worker; audio remains on this iPhone."
+                )
             }
         }
 
         do {
+            await MainActor.run {
+                self.appendProcessingEvent(
+                    recording: recording,
+                    stage: .routing,
+                    state: .running,
+                    title: "Routing to Notion",
+                    detail: "Creating and linking the extracted records in the configured private databases."
+                )
+            }
             let result = try await uploadClient.routeTranscript(transcript, analysis: analysis, recording: recording)
             await applyUploadResult(
                 result,
-                mode: analysis == nil ? "Local transcript · cloud sorting" : "Fully on-device AI"
+                mode: analysis == nil ? "Local transcript · cloud sorting" : "Fully on-device AI",
+                recording: recording
             )
         } catch {
             // The local transcript is already available. Do not upload audio merely because delivery failed.
-            await MainActor.run { uploadState = error.localizedDescription }
+            await MainActor.run {
+                uploadState = error.localizedDescription
+                self.appendProcessingEvent(
+                    recording: recording,
+                    stage: .routing,
+                    state: .failed,
+                    title: "Notion routing failed",
+                    detail: Self.safeProcessingFailure(error, fallback: "The transcript is still on this iPhone, but the configured Worker could not route it.")
+                )
+            }
         }
     }
 
     @MainActor
-    private func applyUploadResult(_ result: AnkerCoreUploadResult, mode: String) {
+    private func applyUploadResult(_ result: AnkerCoreUploadResult, mode: String, recording: RecordingMetadata) {
         processingMode = mode
         let webhookSuffix: String
         if result.webhook?.configured == true {
@@ -757,17 +889,54 @@ final class BluetoothProbe: NSObject, ObservableObject {
         } else {
             webhookSuffix = ""
         }
+        let links = processingLinks(from: result)
+        let webhookFailed = result.webhook?.configured == true && result.webhook?.delivered != true
+        if result.webhook?.configured == true {
+            appendProcessingEvent(
+                recording: recording,
+                stage: .delivery,
+                state: result.webhook?.delivered == true ? .succeeded : .attention,
+                title: result.webhook?.delivered == true ? "Webhook delivered" : "Webhook delivery failed",
+                detail: result.webhook?.delivered == true
+                    ? "The configured webhook accepted the sanitized processing event."
+                    : "Notion processing completed, but the optional webhook did not accept the event."
+            )
+        }
         if let destination = result.routed?.destination {
             lastDestinationURL = destination
             let count = result.routed?.itemCount ?? result.routed?.destinations?.count ?? 1
             uploadState = "Processed \(count) \(count == 1 ? "item" : "items") · \(result.routed?.area ?? "Needs Review")\(webhookSuffix)"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .routing,
+                state: webhookFailed ? .attention : .succeeded,
+                title: webhookFailed ? "Processed with a delivery warning" : "Processing complete",
+                detail: "Created \(count) \(count == 1 ? "item" : "items") in Notion as \(result.routed?.area ?? "Needs Review") using \(mode).",
+                links: links
+            )
             refreshTasks()
         } else if result.routed?.reason == "already_routed" {
             lastDestinationURL = result.source
             uploadState = "This recording was already processed\(webhookSuffix)"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .routing,
+                state: webhookFailed ? .attention : .succeeded,
+                title: "Recording already processed",
+                detail: "The Worker found an existing routed record and did not create a duplicate.",
+                links: links
+            )
         } else {
             lastDestinationURL = result.source
             uploadState = "Transcribed; open Notion to review routing\(webhookSuffix)"
+            appendProcessingEvent(
+                recording: recording,
+                stage: .routing,
+                state: .attention,
+                title: "Routing needs review",
+                detail: "Transcription completed, but AnkerCore could not confidently place the extracted content.",
+                links: links
+            )
         }
     }
 
@@ -780,17 +949,35 @@ final class BluetoothProbe: NSObject, ObservableObject {
             endTime: duration.map { fileID &+ $0 },
             sizeBytes: 0
         )
+        if !recordings.contains(where: { $0.id == fileID }) {
+            recordings.insert(metadata, at: 0)
+        }
+        appendProcessingEvent(
+            recording: metadata,
+            stage: .capture,
+            state: .running,
+            title: "Recording stopped",
+            detail: "Queued for automatic fetch and processing."
+        )
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self else { return }
             if self.canFetchRecording {
                 self.fetchRecording(metadata)
             } else {
                 self.uploadState = "Could not fetch automatically; use Fetch Audio after reconnecting"
+                self.appendProcessingEvent(
+                    recording: metadata,
+                    stage: .fetch,
+                    state: .failed,
+                    title: "Automatic fetch unavailable",
+                    detail: "Reconnect Soundcore Work, then tap Fetch to retry this recording."
+                )
             }
         }
     }
 
     private func failTransfer(_ message: String) {
+        let failedRecording = pendingTransfer
         try? transferHandle?.close()
         transferHandle = nil
         if let transferURL { try? FileManager.default.removeItem(at: transferURL) }
@@ -800,6 +987,87 @@ final class BluetoothProbe: NSObject, ObservableObject {
         transferURL = nil
         transferFileKey = nil
         transferNonce = nil
+        if let failedRecording {
+            appendProcessingEvent(
+                recording: failedRecording,
+                stage: .fetch,
+                state: .failed,
+                title: "Recording fetch failed",
+                detail: Self.safeTransferFailure(message)
+            )
+        }
+    }
+
+    private func appendProcessingEvent(
+        recording: RecordingMetadata,
+        stage: RecordingProcessingStage,
+        state: RecordingProcessingState,
+        title: String,
+        detail: String,
+        links: [RecordingProcessingLink] = []
+    ) {
+        var log = processingLogs[recording.id] ?? RecordingProcessingLog(
+            id: recording.id,
+            recordedAt: recording.recordedAt,
+            events: []
+        )
+        log.recordedAt = recording.recordedAt
+        log.events.append(RecordingProcessingEvent(stage: stage, state: state, title: title, detail: detail, links: links))
+        log.events = Array(log.events.suffix(50))
+
+        var updated = processingLogs
+        updated[recording.id] = log
+        if updated.count > 100,
+           let oldest = updated.values.min(by: { $0.recordedAt < $1.recordedAt }) {
+            updated.removeValue(forKey: oldest.id)
+        }
+        processingLogs = updated
+        ProcessingLogPersistence.save(updated)
+    }
+
+    private func processingLinks(from result: AnkerCoreUploadResult) -> [RecordingProcessingLink] {
+        var links: [RecordingProcessingLink] = []
+        var seenURLs: Set<String> = []
+        func add(_ title: String, _ url: URL?) {
+            guard let url, url.scheme == "https", seenURLs.insert(url.absoluteString).inserted else { return }
+            links.append(RecordingProcessingLink(title: title, url: url))
+        }
+
+        for destination in result.routed?.destinations ?? [] {
+            let kind = destination.kind.replacingOccurrences(of: "_", with: " ").capitalized
+            add("Open \(kind)", destination.destination)
+            add("Open \(kind) database", destination.database)
+        }
+        add("Open routed item", result.routed?.destination)
+        add("Open destination database", result.routed?.database)
+        add("Open source transcript", result.source)
+        return links
+    }
+
+    private static func safeProcessingFailure(_ error: Error, fallback: String) -> String {
+        guard let uploadError = error as? AnkerCoreUploadError else { return fallback }
+        switch uploadError {
+        case .invalidEndpoint:
+            return "The configured service URL is invalid. Update it in Settings and retry."
+        case .missingToken:
+            return "The private upload token is missing. Update it in Settings and retry."
+        case .invalidResponse:
+            return "The configured Worker returned an invalid response."
+        case .rejected:
+            return "The configured Worker rejected or could not complete the request."
+        case .keychain:
+            return "The private credential could not be read from the iPhone Keychain."
+        }
+    }
+
+    private static func safeTransferFailure(_ message: String) -> String {
+        if message.localizedCaseInsensitiveContains("Bluetooth disconnected") {
+            return "Bluetooth disconnected during the encrypted transfer. Reconnect and retry."
+        }
+        if message.localizedCaseInsensitiveContains("command channel") {
+            return "The recorder command channel was unavailable. Reconnect and retry."
+        }
+        return "The secure audio transfer could not be completed. Reconnect and retry."
     }
 
     private static func recordingList(from data: Data) -> [RecordingMetadata]? {
