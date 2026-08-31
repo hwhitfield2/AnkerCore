@@ -1002,7 +1002,77 @@ function validateSuppliedArtifact(value, transcript, recorded) {
   }
   const fallback = fallbackArtifactBundle(transcript, recorded);
   const bundle = validateArtifactBundle(value, fallback);
-  return bundle;
+  return groundSuppliedArtifact(bundle, transcript, fallback);
+}
+
+function groundSuppliedArtifact(bundle, transcript, fallback) {
+  const people = bundle.people.filter((name) => containsNormalizedPhrase(transcript, name));
+  const project = groundedRelationship(bundle.project, "project", transcript);
+  const client = groundedRelationship(bundle.client, "client", transcript);
+  let meeting = null;
+  if (bundle.meeting && hasMeetingEvidence(transcript)) {
+    const title = /ondeviceanalysis/i.test(bundle.meeting.title) || !isGroundedText(bundle.meeting.title, transcript)
+      ? (fallback.meeting?.title || "Meeting")
+      : bundle.meeting.title;
+    meeting = {
+      title,
+      participants: bundle.meeting.participants.filter((name) => containsNormalizedPhrase(transcript, name)),
+      decisions: bundle.meeting.decisions.filter((item) => isGroundedText(item, transcript)),
+      openQuestions: bundle.meeting.openQuestions.filter((item) => isGroundedText(item, transcript)),
+      followUp: hasActionIntent(transcript) && isGroundedText(bundle.meeting.followUp, transcript) ? bundle.meeting.followUp : "",
+    };
+  }
+  const tasks = bundle.tasks.filter((task) => {
+    const exactQuote = task.sourceQuote && containsNormalizedPhrase(transcript, task.sourceQuote);
+    return exactQuote || (hasActionIntent(transcript) && isGroundedText(task.title, transcript));
+  }).map((task) => ({
+    ...task,
+    owner: containsNormalizedPhrase(transcript, task.owner) ? task.owner : "",
+    sourceQuote: task.sourceQuote && containsNormalizedPhrase(transcript, task.sourceQuote) ? task.sourceQuote : "",
+  }));
+  const ideas = bundle.ideas.filter((idea) => hasIdeaIntent(transcript) && isGroundedText(idea.title, transcript));
+
+  if (!meeting && !tasks.length && !ideas.length) return fallback;
+  return { ...bundle, project, client, people, meeting, tasks, ideas };
+}
+
+function normalizedWords(value) {
+  return String(value || "").normalize("NFKD").toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+}
+
+function containsNormalizedPhrase(haystackValue, needleValue) {
+  const haystack = normalizedWords(haystackValue);
+  const needle = normalizedWords(needleValue);
+  if (!needle.length || needle.length > haystack.length) return false;
+  return haystack.some((_, index) => index <= haystack.length - needle.length && needle.every((word, offset) => haystack[index + offset] === word));
+}
+
+function isGroundedText(candidate, transcript) {
+  const stopWords = new Set(["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "i", "in", "is", "it", "of", "on", "or", "our", "that", "the", "this", "to", "we", "with"]);
+  const words = normalizedWords(candidate).filter((word) => !stopWords.has(word));
+  const transcriptWords = new Set(normalizedWords(transcript));
+  if (!words.length) return false;
+  return words.filter((word) => transcriptWords.has(word)).length / words.length >= 0.6;
+}
+
+function hasMeetingEvidence(transcript) {
+  if (/\b(meeting|discussion|discussed|conference|interview|agenda|minutes|we decided|call with|met with)\b/i.test(transcript)) return true;
+  const labels = [...String(transcript).matchAll(/^(?:Speaker \d+|[\p{L}][\p{L}'-]*(?: [\p{L}][\p{L}'-]*){0,2}):/gimu)]
+    .map((match) => match[0].toLowerCase());
+  return new Set(labels).size > 1;
+}
+
+function hasActionIntent(transcript) {
+  return /\b(remind me|to-do|todo|task|follow up|follow-up|need to|needs to|must|should|will|please|action item)\b/i.test(transcript);
+}
+
+function hasIdeaIntent(transcript) {
+  return /\b(idea|what if|could we|consider|experiment|proposal|suggestion)\b/i.test(transcript);
+}
+
+function groundedRelationship(value, label, transcript) {
+  if (!value) return "";
+  return containsNormalizedPhrase(transcript, `${label} ${value}`) || containsNormalizedPhrase(transcript, `${value} ${label}`) ? value : "";
 }
 
 function cleanStringArray(value, limit, itemLimit) {

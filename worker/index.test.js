@@ -175,6 +175,81 @@ test("reprocess accepts booleans only", async () => {
   assert.equal((await result.json()).error, "invalid_reprocess");
 });
 
+test("supplied on-device analysis cannot invent a meeting or people", async () => {
+  const originalFetch = globalThis.fetch;
+  const created = [];
+  let nextPage = 300;
+  const transcript = "We need to wire up the databases to the next of MCP server.";
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (url.pathname.endsWith(`/blocks/${ids.inbox}/children`)) return response({ results: [] });
+    if (url.pathname.endsWith("/pages") && init.method === "POST") {
+      const isSource = body?.parent?.page_id === ids.inbox;
+      const page = {
+        id: isSource ? "88888888-8888-8888-8888-888888888888" : `cccccccc-cccc-cccc-cccc-${String(nextPage++).padStart(12, "0")}`,
+        url: isSource ? "https://www.notion.so/grounded-source" : `https://www.notion.so/grounded-${nextPage}`,
+      };
+      created.push({ body, page });
+      return response(page);
+    }
+    if (url.pathname.includes("/pages/") && !init.method) {
+      return response({
+        id: "88888888-8888-8888-8888-888888888888",
+        parent: { page_id: ids.inbox },
+        properties: { Name: { type: "title", title: [{ plain_text: "2026-08-31 06:42:31 · AnkerCore 1788183751" }] } },
+        created_time: "2026-08-31T13:42:31Z",
+        url: "https://www.notion.so/grounded-source",
+      });
+    }
+    if (url.pathname.includes("/blocks/") && url.pathname.endsWith("/children")) {
+      return response({ results: [{ type: "paragraph", paragraph: { rich_text: [{ plain_text: transcript }] } }] });
+    }
+    if (url.pathname.includes("/databases/") && url.pathname.endsWith("/query")) return response({ results: [] });
+    if (url.pathname.includes("/pages/") && init.method === "PATCH") return response({ id: "updated" });
+    throw new Error(`Unexpected Notion request: ${init.method || "GET"} ${url.pathname}`);
+  };
+
+  try {
+    const request = new Request("https://example.test/transcript", {
+      method: "POST",
+      headers: { authorization: `Bearer ${"x".repeat(32)}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        file_id: "1788183751",
+        recorded_at: "2026-08-31T13:42:31Z",
+        transcript,
+        analysis: {
+          area: "Work",
+          area_confidence: 0.9,
+          summary: "We need to wire up the databases to the next MCP server.",
+          project: "OnDeviceAnalysis",
+          client: "MCP",
+          people: ["Alice", "Bob", "Charlie"],
+          meeting: {
+            title: "OnDeviceAnalysis Meeting",
+            participants: ["Alice", "Bob", "Charlie"],
+            decisions: ["Wire up the databases to the next MCP server."],
+            open_questions: [],
+            follow_up: "Review the results of the database wire-up.",
+          },
+          tasks: [],
+          ideas: [],
+        },
+      }),
+    });
+    const result = await worker.fetch(request, environment(), {});
+    const payload = await result.json();
+    assert.equal(result.status, 201);
+    assert.equal(payload.routed.item_count, 1);
+    assert.equal(payload.routed.destinations[0].kind, "task");
+    assert.equal(payload.routed.area, "Needs Review");
+    assert.equal(created.filter((item) => item.body?.parent?.database_id === ids.meetings).length, 0);
+    assert.equal(created.filter((item) => item.body?.parent?.database_id === ids.tasks).length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function response(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }

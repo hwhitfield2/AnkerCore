@@ -156,38 +156,135 @@ struct OnDeviceProcessor {
         guard areas.contains(value.area), (0 ... 1).contains(value.areaConfidence),
               value.tasks.count <= 20, value.ideas.count <= 10
         else { throw OnDeviceProcessingError.invalidAnalysis }
+
+        // Foundation Models output is untrusted. Generated structures can be perfectly valid while
+        // still containing plausible-looking people, projects, or actions that were never spoken.
+        // Ground identity-like fields strictly and require transcript evidence for each artifact.
+        let hasMeeting = value.hasMeeting && hasMeetingEvidence(in: transcript)
+        let people = value.people.prefix(20)
+            .map { clean($0, limit: 120) }
+            .filter { !$0.isEmpty && containsPhrase($0, in: transcript) }
+        let participants = hasMeeting ? value.participants.prefix(20)
+            .map { clean($0, limit: 120) }
+            .filter { !$0.isEmpty && containsPhrase($0, in: transcript) } : []
+        let decisions = hasMeeting ? value.decisions.prefix(20)
+            .map { clean($0, limit: 300) }
+            .filter { !$0.isEmpty && isGrounded($0, in: transcript) } : []
+        let followUp = hasMeeting && hasActionIntent(in: transcript) && isGrounded(value.followUp, in: transcript)
+            ? clean(value.followUp, limit: 1_000) : ""
+        let tasks = value.tasks.prefix(20).compactMap { item -> OnDeviceTask? in
+            let title = clean(item.title, limit: 120)
+            let sourceQuote = clean(item.sourceQuote, limit: 500)
+            let exactQuote = !sourceQuote.isEmpty && containsPhrase(sourceQuote, in: transcript)
+            guard !title.isEmpty, exactQuote || (hasActionIntent(in: transcript) && isGrounded(title, in: transcript)) else {
+                return nil
+            }
+            let dueDate = item.dueDate.range(of: #"^20\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) == nil ? "" : item.dueDate
+            let owner = clean(item.owner, limit: 120)
+            return OnDeviceTask(
+                title: title,
+                owner: containsPhrase(owner, in: transcript) ? owner : "",
+                dueDate: dueDate,
+                priority: ["Low", "Medium", "High", "Urgent"].contains(item.priority) ? item.priority : "Medium",
+                summary: clean(item.summary, limit: 1_900),
+                sourceQuote: exactQuote ? sourceQuote : ""
+            )
+        }
+        let ideas = value.ideas.prefix(10).compactMap { item -> OnDeviceIdea? in
+            let title = clean(item.title, limit: 120)
+            guard !title.isEmpty, hasIdeaIntent(in: transcript), isGrounded(title, in: transcript) else { return nil }
+            return OnDeviceIdea(
+                title: title, topic: clean(item.topic, limit: 100), summary: clean(item.summary, limit: 1_900),
+                whyItMatters: clean(item.whyItMatters, limit: 1_000), nextExperiment: clean(item.nextExperiment, limit: 1_000)
+            )
+        }
+        guard hasMeeting || !tasks.isEmpty || !ideas.isEmpty else {
+            // This intentionally triggers transcript-only cloud sorting, which is safer than accepting
+            // a locally generated artifact that has no support in the recording.
+            throw OnDeviceProcessingError.invalidAnalysis
+        }
+
         return OnDeviceAnalysis(
             area: value.area,
             areaConfidence: value.areaConfidence,
             summary: clean(value.summary, limit: 1_900),
-            project: clean(value.project, limit: 120),
-            client: clean(value.client, limit: 120),
-            people: value.people.prefix(20).map { clean($0, limit: 120) }.filter { !$0.isEmpty },
-            hasMeeting: value.hasMeeting,
-            meetingTitle: clean(value.meetingTitle, limit: 120),
-            participants: value.participants.prefix(20).map { clean($0, limit: 120) }.filter { !$0.isEmpty },
-            decisions: value.decisions.prefix(20).map { clean($0, limit: 300) }.filter { !$0.isEmpty },
-            openQuestions: value.openQuestions.prefix(20).map { clean($0, limit: 300) }.filter { !$0.isEmpty },
-            followUp: clean(value.followUp, limit: 1_000),
-            tasks: value.tasks.prefix(20).compactMap { item in
-                let title = clean(item.title, limit: 120)
-                guard !title.isEmpty else { return nil }
-                let dueDate = item.dueDate.range(of: #"^20\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) == nil ? "" : item.dueDate
-                return OnDeviceTask(
-                    title: title, owner: clean(item.owner, limit: 120), dueDate: dueDate,
-                    priority: ["Low", "Medium", "High", "Urgent"].contains(item.priority) ? item.priority : "Medium",
-                    summary: clean(item.summary, limit: 1_900), sourceQuote: clean(item.sourceQuote, limit: 500)
-                )
-            },
-            ideas: value.ideas.prefix(10).compactMap { item in
-                let title = clean(item.title, limit: 120)
-                guard !title.isEmpty else { return nil }
-                return OnDeviceIdea(
-                    title: title, topic: clean(item.topic, limit: 100), summary: clean(item.summary, limit: 1_900),
-                    whyItMatters: clean(item.whyItMatters, limit: 1_000), nextExperiment: clean(item.nextExperiment, limit: 1_000)
-                )
-            }
+            project: groundedRelationship(value.project, label: "project", transcript: transcript),
+            client: groundedRelationship(value.client, label: "client", transcript: transcript),
+            people: people,
+            hasMeeting: hasMeeting,
+            meetingTitle: hasMeeting ? safeTitle(value.meetingTitle, transcript: transcript) : "",
+            participants: participants,
+            decisions: decisions,
+            openQuestions: hasMeeting ? value.openQuestions.prefix(20)
+                .map { clean($0, limit: 300) }
+                .filter { !$0.isEmpty && isGrounded($0, in: transcript) } : [],
+            followUp: followUp,
+            tasks: tasks,
+            ideas: ideas
         )
+    }
+
+    private func normalizedWords(_ value: String) -> [String] {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+    }
+
+    private func containsPhrase(_ candidate: String, in transcript: String) -> Bool {
+        let needle = normalizedWords(candidate)
+        let haystack = normalizedWords(transcript)
+        guard !needle.isEmpty, needle.count <= haystack.count else { return false }
+        return (0 ... haystack.count - needle.count).contains { index in
+            Array(haystack[index ..< index + needle.count]) == needle
+        }
+    }
+
+    private func isGrounded(_ candidate: String, in transcript: String) -> Bool {
+        let stopWords: Set<String> = ["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "i", "in", "is", "it", "of", "on", "or", "our", "that", "the", "this", "to", "we", "with"]
+        let candidateWords = normalizedWords(candidate).filter { !stopWords.contains($0) }
+        let transcriptWords = Set(normalizedWords(transcript))
+        guard !candidateWords.isEmpty else { return false }
+        let matches = candidateWords.filter { transcriptWords.contains($0) }.count
+        return Double(matches) / Double(candidateWords.count) >= 0.6
+    }
+
+    private func hasMeetingEvidence(in transcript: String) -> Bool {
+        let lower = transcript.lowercased()
+        if lower.range(of: #"\b(meeting|discussion|discussed|conference|interview|agenda|minutes|we decided|call with|met with)\b"#, options: .regularExpression) != nil {
+            return true
+        }
+        let labels = transcript.matches(of: /(?m)^(?:Speaker \d+|[\p{L}][\p{L}'-]*(?: [\p{L}][\p{L}'-]*){0,2}):/)
+        return Set(labels.map { String($0.output).lowercased() }).count > 1
+    }
+
+    private func hasActionIntent(in transcript: String) -> Bool {
+        transcript.lowercased().range(
+            of: #"\b(remind me|to-do|todo|task|follow up|follow-up|need to|needs to|must|should|will|please|action item)\b"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func hasIdeaIntent(in transcript: String) -> Bool {
+        transcript.lowercased().range(
+            of: #"\b(idea|what if|could we|consider|experiment|proposal|suggestion)\b"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func groundedRelationship(_ value: String, label: String, transcript: String) -> String {
+        let entity = clean(value, limit: 120)
+        guard !entity.isEmpty else { return "" }
+        return containsPhrase("\(label) \(entity)", in: transcript) || containsPhrase("\(entity) \(label)", in: transcript) ? entity : ""
+    }
+
+    private func safeTitle(_ value: String, transcript: String) -> String {
+        let title = clean(value, limit: 120)
+        if !title.lowercased().contains("ondeviceanalysis"), isGrounded(title, in: transcript) { return title }
+        let words = transcript.replacingOccurrences(of: #"(?m)^(?:Speaker \d+|[\p{L}][\p{L}'-]*(?: [\p{L}][\p{L}'-]*){0,2}):\s*"#, with: "", options: .regularExpression)
+            .split(whereSeparator: { $0.isWhitespace })
+            .prefix(10)
+        let fallback = words.joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: ".,!?;:"))
+        return clean(fallback.isEmpty ? "Meeting" : fallback, limit: 120)
     }
 
     private func clean(_ value: String, limit: Int) -> String {

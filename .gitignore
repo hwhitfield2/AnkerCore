@@ -5,6 +5,7 @@
 !.env.example
 .wrangler/
 worker/.wrangler/
+worker/wrangler.production.local.jsonc
 
 # Xcode and Swift
 DerivedData/
