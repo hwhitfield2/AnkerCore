@@ -267,7 +267,7 @@ struct ContentView: View {
                     }
                     .padding(.vertical, 8)
                 } else {
-                    ForEach(Array(probe.recordings.prefix(6).enumerated()), id: \.element.id) { index, recording in
+                    ForEach(Array(probe.recordings.enumerated()), id: \.element.id) { index, recording in
                         if index > 0 { Divider().overlay(RelayPalette.stroke) }
                         RecordingRow(probe: probe, recording: recording)
                     }

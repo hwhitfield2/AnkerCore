@@ -26,6 +26,12 @@ struct RecordingMetadata: Identifiable {
     var recordedAt: Date { Date(timeIntervalSince1970: TimeInterval(id)) }
 }
 
+private struct RecordingListPage {
+    let commandType: UInt8
+    let fileCount: Int
+    let recordings: [RecordingMetadata]
+}
+
 struct ProbeEvent: Identifiable, Codable {
     let id: UUID
     let timestamp: Date
@@ -78,7 +84,12 @@ final class BluetoothProbe: NSObject, ObservableObject {
             && pendingTransfer == nil
             && !recordingsLoading
     }
-    var canFetchRecording: Bool { recorderCommandChannelReady && transferHandle == nil && pendingTransfer == nil }
+    var canFetchRecording: Bool {
+        recorderCommandChannelReady
+            && transferHandle == nil
+            && pendingTransfer == nil
+            && !recordingsLoading
+    }
 
     private var central: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
@@ -87,6 +98,10 @@ final class BluetoothProbe: NSObject, ObservableObject {
     private var recordingListRequestID: UUID?
     private var recordingListTimeoutWorkItem: DispatchWorkItem?
     private var recordingListRefreshWorkItem: DispatchWorkItem?
+    private var recordingListPageWorkItem: DispatchWorkItem?
+    private var recordingListPage = 0
+    private var recordingListCommandType: UInt8 = 0x1B
+    private var recordingListEntries: [UInt32: RecordingMetadata] = [:]
     private let secureSession = D3200SecureSession()
     private var pendingTransfer: RecordingMetadata?
     private var transferHandle: FileHandle?
@@ -175,13 +190,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
 
     func loadRecordings() {
         guard !recordingsLoading else { return }
-        guard let peripheral = connectedPeripheral,
-              let characteristic = writeCharacteristic,
-              characteristic.service?.uuid.uuidString.uppercased()
-                == "020CF5DA-0000-1000-8000-00805F9B34FB",
-              characteristic.uuid.uuidString.uppercased()
-                == "00007777-0000-1000-8000-00805F9B34FB"
-        else {
+        guard transferHandle == nil, pendingTransfer == nil, recorderCommandChannelReady else {
             recordingListState = "Recorder command channel is not ready"
             return
         }
@@ -190,30 +199,59 @@ final class BluetoothProbe: NSObject, ObservableObject {
         recordingsLoading = true
         let requestID = UUID()
         recordingListRequestID = requestID
-        // Whitelisted, non-destructive command: list recording metadata, page zero.
-        let command = Self.d3200Command(type: 0x1B, id: 0x0E, payload: Data([0x00, 0x00]))
+        recordingListPage = 0
+        recordingListCommandType = 0x1B
+        recordingListEntries.removeAll()
+        recordingListState = "Loading all recordings…"
+        requestRecordingListPage(type: recordingListCommandType, page: recordingListPage, requestID: requestID)
+    }
+
+    private func sendRecordingListPage(type: UInt8, page: Int) -> Bool {
+        guard page >= 0, page <= Int(UInt16.max),
+              let peripheral = connectedPeripheral,
+              let characteristic = writeCharacteristic,
+              characteristic.service?.uuid.uuidString.uppercased()
+                == "020CF5DA-0000-1000-8000-00805F9B34FB",
+              characteristic.uuid.uuidString.uppercased()
+                == "00007777-0000-1000-8000-00805F9B34FB"
+        else { return false }
+
+        let pageNumber = UInt16(page)
+        let payload = Data([UInt8(pageNumber & 0xFF), UInt8(pageNumber >> 8)])
+        let command = Self.d3200Command(type: type, id: 0x0E, payload: payload)
         let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.write)
             ? .withResponse
             : .withoutResponse
         peripheral.writeValue(command, for: characteristic, type: writeType)
-        recordingListState = "Loading recording list…"
-        scheduleRecordingListTimeout(for: requestID)
         record(
             kind: "command",
-            summary: "Requested recording metadata (page 1)",
+            summary: "Requested recording metadata (page \(page + 1))",
             peripheral: peripheral,
             service: characteristic.service?.uuid,
             characteristic: characteristic.uuid
         )
+        return true
+    }
+
+    private func requestRecordingListPage(type: UInt8, page: Int, requestID: UUID) {
+        guard recordingListRequestID == requestID, sendRecordingListPage(type: type, page: page) else {
+            finishRecordingListRequest()
+            recordingListState = "Recorder command channel is not ready"
+            return
+        }
+        scheduleRecordingListTimeout(for: requestID)
     }
 
     private func scheduleRecordingListTimeout(for requestID: UUID) {
         recordingListTimeoutWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.recordingListRequestID == requestID else { return }
-            self.recordingListRequestID = nil
-            self.recordingsLoading = false
-            self.recordingListState = "Recorder did not return its list — tap Refresh to retry"
+            let loadedCount = self.recordingListEntries.count
+            let failedPage = self.recordingListPage + 1
+            self.finishRecordingListRequest()
+            self.recordingListState = loadedCount == 0
+                ? "Recorder did not return its list — tap Refresh to retry"
+                : "Loaded \(loadedCount); page \(failedPage) timed out"
         }
         recordingListTimeoutWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
@@ -222,8 +260,59 @@ final class BluetoothProbe: NSObject, ObservableObject {
     private func finishRecordingListRequest() {
         recordingListTimeoutWorkItem?.cancel()
         recordingListTimeoutWorkItem = nil
+        recordingListPageWorkItem?.cancel()
+        recordingListPageWorkItem = nil
         recordingListRequestID = nil
         recordingsLoading = false
+    }
+
+    private func handleRecordingListPage(_ page: RecordingListPage) {
+        guard transferHandle == nil,
+              pendingTransfer == nil,
+              let requestID = recordingListRequestID
+        else { return }
+        guard page.commandType == recordingListCommandType else { return }
+
+        recordingListTimeoutWorkItem?.cancel()
+        recordingListTimeoutWorkItem = nil
+        let previousCount = recordingListEntries.count
+        for recording in page.recordings {
+            recordingListEntries[recording.id] = recording
+        }
+        recordings = recordingListEntries.values.sorted { $0.id > $1.id }
+        syncWidgetSnapshot()
+
+        let foundNewRecordings = recordingListEntries.count > previousCount
+        let recorderRepeatedFullPage = page.fileCount == 10 && !foundNewRecordings
+        guard page.fileCount == 10,
+              foundNewRecordings,
+              recordingListPage < Int(UInt16.max)
+        else {
+            finishRecordingListRequest()
+            if recordings.isEmpty {
+                recordingListState = "No recordings found"
+            } else if recorderRepeatedFullPage {
+                recordingListState = "Loaded \(recordings.count); recorder repeated page \(recordingListPage + 1)"
+            } else {
+                recordingListState = "Loaded all \(recordings.count) recording(s)"
+            }
+            return
+        }
+
+        recordingListPage += 1
+        let nextPage = recordingListPage
+        recordingListState = "Loading all recordings… \(recordings.count) found"
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.recordingListRequestID == requestID else { return }
+            self.requestRecordingListPage(
+                type: self.recordingListCommandType,
+                page: nextPage,
+                requestID: requestID
+            )
+        }
+        recordingListPageWorkItem = work
+        // Match the recorder SDK's normal command spacing and avoid overrunning BLE firmware.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     private func scheduleRecordingListRefresh(after delay: TimeInterval = 0.4) {
@@ -241,6 +330,12 @@ final class BluetoothProbe: NSObject, ObservableObject {
     }
 
     func fetchRecording(_ recording: RecordingMetadata) {
+        if recordingsLoading {
+            finishRecordingListRequest()
+            recordingListState = recordings.isEmpty
+                ? "Inventory paused for audio fetch"
+                : "Loaded \(recordings.count) recording(s)"
+        }
         guard transferHandle == nil, pendingTransfer == nil else {
             reconnectFetches[recording.id] = recording
             uploadState = "Recording queued behind the active audio transfer…"
@@ -1508,7 +1603,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         return "The secure audio transfer could not be completed. Reconnect and retry."
     }
 
-    private static func recordingList(from data: Data) -> [RecordingMetadata]? {
+    private static func recordingListPage(from data: Data) -> RecordingListPage? {
         guard data.count >= 10,
               data[0] == 0x09,
               data[1] == 0xFF,
@@ -1521,7 +1616,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         guard declaredLength == data.count, checksum == data.last else { return nil }
 
         let payload = Data(data[9 ..< data.count - 1])
-        guard payload.count >= 2 else { return [] }
+        guard payload.count >= 2 else { return nil }
         let count = Int(payload[0]) | (Int(payload[1]) << 8)
         guard count <= 10 else { return nil }
 
@@ -1543,36 +1638,40 @@ final class BluetoothProbe: NSObject, ObservableObject {
             }
             offset += entrySize
         }
-        return result.sorted { $0.id > $1.id }
+        return RecordingListPage(
+            commandType: data[5],
+            fileCount: count,
+            recordings: result.sorted { $0.id > $1.id }
+        )
     }
 
     private func requestLegacyRecordingListIfNeeded(for data: Data) -> Bool {
         guard !metadataFallbackRequested,
+              recordingListRequestID != nil,
+              recordingListCommandType == 0x1B,
+              recordingListPage == 0,
+              recordingListEntries.isEmpty,
               data.count == 10,
               data[0] == 0x09,
               data[1] == 0xFF,
               data[5] == 0x1B,
-              data[6] == 0x0E,
-              let peripheral = connectedPeripheral,
-              let characteristic = writeCharacteristic
+              data[6] == 0x0E
         else { return false }
 
         metadataFallbackRequested = true
-        let fallback = Self.d3200Command(type: 0x1A, id: 0x0E, payload: Data([0x00, 0x00]))
-        let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.write)
-            ? .withResponse
-            : .withoutResponse
-        peripheral.writeValue(fallback, for: characteristic, type: writeType)
+        recordingListCommandType = 0x1A
+        recordingListPage = 0
+        recordingListEntries.removeAll()
         recordingListState = "Trying compatibility inventory request…"
         if let requestID = recordingListRequestID {
-            scheduleRecordingListTimeout(for: requestID)
+            requestRecordingListPage(type: recordingListCommandType, page: 0, requestID: requestID)
         }
         record(
             kind: "command",
             summary: "New inventory request returned no entries; requested compatibility inventory",
-            peripheral: peripheral,
-            service: characteristic.service?.uuid,
-            characteristic: characteristic.uuid
+            peripheral: connectedPeripheral,
+            service: writeCharacteristic?.service?.uuid,
+            characteristic: writeCharacteristic?.uuid
         )
         return true
     }
@@ -1824,13 +1923,8 @@ extension BluetoothProbe: CBPeripheralDelegate {
         let transferSummary = handleSecureTransferFrame(data)
         let decoded = Self.decodedD3200Event(data)
         let requestedFallback = requestLegacyRecordingListIfNeeded(for: data)
-        if !requestedFallback, let loadedRecordings = Self.recordingList(from: data) {
-            finishRecordingListRequest()
-            recordings = loadedRecordings
-            recordingListState = loadedRecordings.isEmpty
-                ? "No recordings found"
-                : "Loaded \(loadedRecordings.count) recording(s)"
-            syncWidgetSnapshot()
+        if !requestedFallback, let page = Self.recordingListPage(from: data) {
+            handleRecordingListPage(page)
         }
         if let decoded {
             if let state = decoded.state { recorderState = state }
