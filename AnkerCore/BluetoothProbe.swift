@@ -1027,6 +1027,7 @@ final class BluetoothProbe: NSObject, ObservableObject {
         }
         guard !processingRecordingIDs.contains(recording.id) else { return }
         processingRecordingIDs.insert(recording.id)
+        ProcessingNotifications.shared.started(recording, reprocess: reprocess)
         uploadState = "Transcribing on this iPhone…"
         processingMode = "On-device preferred"
         lastDestinationURL = nil
@@ -1070,13 +1071,18 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 } catch {
                     await MainActor.run {
                         uploadState = error.localizedDescription
+                        let detail = Self.safeProcessingFailure(
+                            error,
+                            fallback: "The configured Worker could not process this recording."
+                        )
                         self.appendProcessingEvent(
                             recording: recording,
                             stage: .routing,
                             state: .failed,
                             title: "Cloud processing failed",
-                            detail: Self.safeProcessingFailure(error, fallback: "The configured Worker could not process this recording.")
+                            detail: detail
                         )
+                        ProcessingNotifications.shared.needsAttention(recording, body: detail)
                     }
                 }
                 return
@@ -1151,13 +1157,18 @@ final class BluetoothProbe: NSObject, ObservableObject {
             // The local transcript is already available. Do not upload audio merely because delivery failed.
             await MainActor.run {
                 uploadState = error.localizedDescription
+                let detail = Self.safeProcessingFailure(
+                    error,
+                    fallback: "The transcript is still on this iPhone, but the configured Worker could not route it."
+                )
                 self.appendProcessingEvent(
                     recording: recording,
                     stage: .routing,
                     state: .failed,
                     title: "Notion routing failed",
-                    detail: Self.safeProcessingFailure(error, fallback: "The transcript is still on this iPhone, but the configured Worker could not route it.")
+                    detail: detail
                 )
+                ProcessingNotifications.shared.needsAttention(recording, body: detail)
             }
         }
     }
@@ -1196,6 +1207,10 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 detail: "Created \(count) \(count == 1 ? "item" : "items") in Notion as \(result.routed?.area ?? "Needs Review") using \(mode).",
                 links: links
             )
+            ProcessingNotifications.shared.completed(
+                recording,
+                body: "Created \(count) \(count == 1 ? "item" : "items") in Notion as \(result.routed?.area ?? "Needs Review")."
+            )
             refreshTasks()
         } else if result.routed?.reason == "already_routed" {
             lastDestinationURL = result.source
@@ -1208,6 +1223,10 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 detail: "The Worker found an existing routed record and did not create a duplicate.",
                 links: links
             )
+            ProcessingNotifications.shared.completed(
+                recording,
+                body: "This recording was already processed; no duplicate Notion items were created."
+            )
         } else {
             lastDestinationURL = result.source
             uploadState = "Transcribed; open Notion to review routing\(webhookSuffix)"
@@ -1218,6 +1237,10 @@ final class BluetoothProbe: NSObject, ObservableObject {
                 title: "Routing needs review",
                 detail: "Transcription completed, but AnkerCore could not confidently place the extracted content.",
                 links: links
+            )
+            ProcessingNotifications.shared.needsAttention(
+                recording,
+                body: "Transcription finished, but AnkerCore could not confidently place the result."
             )
         }
     }
